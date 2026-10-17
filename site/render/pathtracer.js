@@ -63,7 +63,7 @@ export async function disposePathTracer() {
 }
 
 async function render({ viewer, view = 'hero', width = 1600, height = 1100, samples = 256, onProgress, signal,
-  studio = STUDIO } = {}) {
+  studio = STUDIO, _wgsl } = {}) {
   if (!viewer || !viewer.model) throw new Error('renderPhoto: the viewer has no model');
   const T0 = performance.now();
   const gpu = await getGPU(viewer);
@@ -122,7 +122,8 @@ async function render({ viewer, view = 'hero', width = 1600, height = 1100, samp
   bufs.push(bOut, bRead, bRes);
 
   try {
-    const { trace, resolve } = await gpu.pipelines;
+    // _wgsl: a patched kernel source (tests only), compiled for this render
+    const { trace, resolve } = await (_wgsl ? compile(device, _wgsl) : gpu.pipelines);
     const T2 = performance.now();
     device.pushErrorScope('validation');
     const bgTrace = device.createBindGroup({
@@ -262,9 +263,9 @@ function getGPU(viewer) {
   return p;
 }
 
-async function compile(device) {
-  const mod = (code, label) => device.createShaderModule({ code, label });
-  const tm = mod(traceWGSL, 'kigumi-pathtracer');
+async function compile(device, code = traceWGSL) {
+  const mod = (c, label) => device.createShaderModule({ code: c, label });
+  const tm = mod(code, 'kigumi-pathtracer');
   const rm = mod(resolveWGSL, 'kigumi-resolve');
   for (const m of [tm, rm]) {
     const info = await m.getCompilationInfo();

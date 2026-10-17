@@ -67,27 +67,29 @@ fn hash1(x: u32) -> u32 {
   v ^= v >> 16u;
   return v;
 }
-fn sobol1(i: u32) -> u32 {          // second Sobol dimension (x + 1)
-  var r = 0u;
-  var v = 0x80000000u;
-  var j = i;
-  loop {
-    if (j == 0u) { break; }
-    if ((j & 1u) != 0u) { r ^= v; }
-    j >>= 1u;
-    v ^= v >> 1u;
-  }
-  return r;
+// Sobol's second dimension is the Pascal matrix mod 2: by Lucas' theorem, output bit
+// p (from the top) is the XOR of index bits k with p a submask of k, a superset
+// zeta transform over the 5-bit bit positions; returned bit-reversed, i.e. the
+// value is sobol1(i) = reverseBits(zeta(i)).
+fn zeta(i: u32) -> u32 {
+  var x = i;
+  x ^= (x >> 1u) & 0x55555555u;
+  x ^= (x >> 2u) & 0x33333333u;
+  x ^= (x >> 4u) & 0x0f0f0f0fu;
+  x ^= (x >> 8u) & 0x00ff00ffu;
+  x ^= (x >> 16u) & 0x0000ffffu;
+  return x;
 }
+// nus(reverseBits(x), s) == reverseBits(lk(x, s)): the scrambles below skip a reversal
 fn rand2(si: u32, seed: u32) -> vec2f {
   let i = nus(si, seed);
-  let a = nus(reverseBits(i), hash1(seed ^ 0xa511e9b3u));
-  let b = nus(sobol1(i), hash1(seed ^ 0x63d83595u));
+  let a = reverseBits(lk(i, hash1(seed ^ 0xa511e9b3u)));
+  let b = reverseBits(lk(zeta(i), hash1(seed ^ 0x63d83595u)));
   return vec2f(vec2u(a, b) >> vec2u(8u)) * (1.0 / 16777216.0);
 }
 fn rand1(si: u32, seed: u32) -> f32 {
   let i = nus(si, seed);
-  let a = nus(reverseBits(i), hash1(seed ^ 0xa511e9b3u));
+  let a = reverseBits(lk(i, hash1(seed ^ 0xa511e9b3u)));
   return f32(a >> 8u) * (1.0 / 16777216.0);
 }
 // seed of dimension set k at path event 'depth'
