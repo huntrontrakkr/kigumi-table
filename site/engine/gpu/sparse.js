@@ -24,7 +24,7 @@
 import { WG, NF, F, MAX_GRID, layoutFor, rowKernel, reduceKernel, axpyKernel, xpbyKernel } from './kernels.js';
 import {
   asInt32, asFloat64, checkCSR, jacobiScale, fsai, transposeCSR, residualRowMajor,
-  residualFloorRowMajor, colNormsRowMajor, colToRow, rowToCol, sameArray,
+  colNormsRowMajor, colToRow, rowToCol, sameArray,
 } from './csr.js';
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -34,8 +34,9 @@ export const DEFAULTS = Object.freeze({
   maxRefine: 15,      // cap on outer (float64) refinements
   precond: 'fsai',    // 'fsai' (pattern of tril(A)), 'fsai2' (tril(A^2): fewer, dearer iterations), 'jacobi'
   checkEvery: 32,     // longest stretch of GPU iterations between read-backs
-  minGain: 0.5,       // a refinement must cut a column's residual by this factor ...
-  maxSlow: 2,         // ... or, after this many slow ones in a row, the column stops
+  minGain: 0.5,       // a column stops after `patience` refinements without cutting its
+  patience: 2,        //   residual by this factor
+  floorFactor: 4,     // 'converged' also accepts relres <= floorFactor * float64 floor (see below)
   maxCols: 256,       // right-hand sides per GPU batch (more are solved in chunks)
   memBudget: 512 * 1024 * 1024,   // bytes of GPU vectors per batch
 });
@@ -394,8 +395,11 @@ async function innerSolve(gpu, st, rs, opt) {
       active++;
       const rr = sc[F.RR * kp + j];
       const tol2 = sc[F.TOL2 * kp + j];
+      // stagnation: rr has not dropped 4x below its best for the last half of the run
+      // (and >= 1000 iterations: the PCG residual 2-norm can rise for hundreds of
+      // iterations on stiff 4th-order problems before it falls)
       if (rr < 0.25 * best[j]) { best[j] = rr; bestAt[j] = its; }
-      if (its - bestAt[j] < Math.max(256, its / 2)) stalled = false;
+      if (its - bestAt[j] < Math.max(1000, its / 2)) stalled = false;
       // iterations still needed at the current rate (log-linear model)
       const rate = first || !(prevRR[j] > 0) ? 0 : Math.log(rr / prevRR[j]) / m;
       const est = rate < 0 && tol2 > 0 ? Math.log(tol2 / rr) / rate : opt.checkEvery;
@@ -429,7 +433,18 @@ function relOf(rn, bn) {
 
 const maxOf = (a) => { let m = 0; for (let i = 0; i < a.length; i++) if (!(a[i] <= m)) m = a[i]; return m; };
 
-/** Mixed-precision refinement for columns [j0, j0+m) of the problem. */
+/**
+ * Mixed-precision refinement for columns [j0, j0+m) of the problem.
+ *
+ * Every refinement step x += S d is taken (classical iterative refinement):
+ * the float32 inner solve reduces the *error* by roughly eta (or by what
+ * float32 can resolve, ~ cond(As) * 2^-24), but on stiff mixed-unit systems the
+ * first steps can raise the unscaled residual norm while the error drops by
+ * orders of magnitude (beam tests), so steps are not judged by the residual.
+ * The iterate with the lowest residual is kept per column and returned.  A
+ * column stops when relres <= tol, when relres reaches its float64 floor, or
+ * after `patience` refinements without halving its residual.
+ */
 async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   const n = prep.n;
   const lay = layoutFor(m);
@@ -438,25 +453,36 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   const { s, indptr, indices, data } = prep;
   const b = colToRow(n, m, rhs, j0);
   const x = x0 ? colToRow(n, m, x0, j0) : new Float64Array(n * m);
+  const xBest = Float64Array.from(x);
   const r = new Float64Array(n * m);
+  const floor = new Float64Array(m);
   let tc = now();
-  residualRowMajor(n, m, indptr, indices, data, x, b, r);
+  residualRowMajor(n, m, indptr, indices, data, x, b, r, x0 ? floor : null);
   const bn = colNormsRowMajor(n, m, b);
   const rel = relOf(colNormsRowMajor(n, m, r), bn);
   let cpuMs = now() - tc;
   let gpuMs = 0;
-  const stalled = new Uint8Array(m);
-  const slow = new Uint8Array(m);
+  const best = Float64Array.from(rel);          // lowest relres so far (iterate in xBest)
+  const mark = Float64Array.from(rel);          // relres at the last halving ...
+  const markAt = new Int32Array(m).fill(-1);    // ... and when
+  const done = new Uint8Array(m);
+  const why = new Array(m).fill('');
   const history = [{ relres: maxOf(rel), iters: 0 }];
   const rs = new Float32Array(n * kp);
   const nu = new Float64Array(m);
-  const xNew = new Float64Array(n * m);
-  const rNew = new Float64Array(n * m);
+  const okCol = new Uint8Array(m);
   let iters = 0;
   let refinements = 0;
+  const stop = (j, ref) => {
+    if (rel[j] <= tol) return 'tol';
+    if (floor[j] > 0 && rel[j] <= floor[j]) return 'floor';
+    if (ref - markAt[j] >= opt.patience) return 'stalled';
+    return '';
+  };
+  for (let j = 0; j < m; j++) if ((why[j] = rel[j] <= tol ? 'tol' : '')) done[j] = 1;
   for (let ref = 0; ref < opt.maxRefine; ref++) {
     const act = [];
-    for (let j = 0; j < m; j++) if (rel[j] > tol && !stalled[j]) act.push(j);
+    for (let j = 0; j < m; j++) if (!done[j]) act.push(j);
     if (!act.length) break;
     // scaled residuals, each column normalised to unit length (float32-safe)
     tc = now();
@@ -476,34 +502,50 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     gpuMs += now() - tg;
     iters += inner.its;
     refinements++;
-    // candidate x + S d, accepted per column only if it lowers the residual
+    // x += S d (columns with a non-finite correction are left alone and stop)
     tc = now();
-    xNew.set(x);
+    for (const j of act) {
+      let ok = nu[j] > 0;
+      for (let i = 0; ok && i < n; i++) if (!Number.isFinite(inner.X[i * kp + j])) ok = false;
+      okCol[j] = ok ? 1 : 0;
+    }
     for (let i = 0; i < n; i++) {
       const si = s[i];
-      for (const j of act) xNew[i * m + j] += nu[j] * si * inner.X[i * kp + j];
+      for (const j of act) if (okCol[j]) x[i * m + j] += nu[j] * si * inner.X[i * kp + j];
     }
-    residualRowMajor(n, m, indptr, indices, data, xNew, b, rNew);
-    const relNew = relOf(colNormsRowMajor(n, m, rNew), bn);
+    // the float64 floor depends on |x| only: evaluate it with the first refined x and at the end
+    residualRowMajor(n, m, indptr, indices, data, x, b, r, ref === 0 ? floor : null);
+    const relNew = relOf(colNormsRowMajor(n, m, r), bn);
     for (const j of act) {
-      if (relNew[j] < rel[j]) {
-        for (let i = 0; i < n; i++) { x[i * m + j] = xNew[i * m + j]; r[i * m + j] = rNew[i * m + j]; }
-        slow[j] = relNew[j] > opt.minGain * rel[j] ? slow[j] + 1 : 0;
-        if (slow[j] >= opt.maxSlow) stalled[j] = 1;
-        rel[j] = relNew[j];
-      } else {
-        stalled[j] = 1;           // no progress: keep the previous iterate
+      rel[j] = relNew[j];
+      if (rel[j] < best[j]) {
+        best[j] = rel[j];
+        for (let i = 0; i < n; i++) xBest[i * m + j] = x[i * m + j];
       }
+      if (rel[j] <= opt.minGain * mark[j]) { mark[j] = rel[j]; markAt[j] = ref; }
+      why[j] = okCol[j] ? stop(j, ref) : 'non-finite';
+      if (why[j]) done[j] = 1;
     }
     cpuMs += now() - tc;
     let innerRel = 0;
     for (const j of act) innerRel = Math.max(innerRel, inner.colRel[j]);
-    history.push({ relres: maxOf(rel), iters: inner.its, innerRel, stagnated: inner.stagnated, active: act.length });
+    history.push({ relres: maxOf(rel), iters: inner.its, innerRel, stagnated: inner.stagnated, active: act.length,
+      ...(m <= 16 ? { cols: Array.from(rel), innerCols: act.map((j) => inner.colRel[j]) } : {}) });
   }
+  // return the best iterate of each column
   tc = now();
-  const floor = residualFloorRowMajor(n, m, indptr, indices, data, x, b);
+  let restored = false;
+  for (let j = 0; j < m; j++) {
+    if (!(rel[j] <= best[j])) {
+      for (let i = 0; i < n; i++) x[i * m + j] = xBest[i * m + j];
+      restored = true;
+    }
+  }
+  residualRowMajor(n, m, indptr, indices, data, x, b, r, floor);
+  const relFinal = relOf(colNormsRowMajor(n, m, r), bn);
   cpuMs += now() - tc;
-  return { x, relres: rel, floor, iters, refinements, history, gpuMs, cpuMs, kp };
+  for (let j = 0; j < m; j++) if (!why[j]) why[j] = 'maxRefine';
+  return { x, relres: relFinal, floor, iters, refinements, history, gpuMs, cpuMs, kp, restored, why };
 }
 
 // -------------------------------------------------------------------- API
@@ -519,10 +561,17 @@ let queue = Promise.resolve();
  *   refinement, default max(2000, 2n)), x0 (initial guess, column-major), and
  *   tuning knobs from DEFAULTS (eta, maxRefine, precond, checkEvery, ...).
  * Returns { x: Float64Array(n*k), iters, refinements, relres: Float64Array(k),
- *   ms, converged } plus diagnostics (setupMs, gpuMs, cpuMs, precond, history).
+ *   ms, converged } plus diagnostics: floor (Float64Array(k), the float64
+ *   attainable-residual estimate u||A||x|+|b||/||b|| of each column), tolMet
+ *   (every relres <= tol), stopped (per column: 'tol' | 'floor' | 'stalled' |
+ *   'maxRefine' | 'non-finite'), setupMs, gpuMs, cpuMs, precond, history.
+ * converged: every column has relres <= tol, or relres <= floorFactor * floor
+ *   (solved to float64 working precision: no float64 method -- SuperLU
+ *   included -- certifies a smaller residual for that column).  Use tolMet for
+ *   the strict test.
  * Calls are serialised (the GPU buffers are shared).  Throws on malformed input
  * or a non-positive diagonal; returns converged = false if the tolerance is not
- * reached (relres then says how far it got).
+ * reached (relres then says how far it got; x is the best iterate found).
  */
 export function solveSPD(gpu, opts) {
   const run = queue.then(() => solveImpl(gpu, opts));
@@ -566,12 +615,14 @@ async function solveImpl(gpu, o) {
   let gpuMs = 0;
   let cpuMs = 0;
   const history = [];
+  const stopped = new Array(k);
   for (let j0 = 0; j0 < k; j0 += kc) {
     const m = Math.min(kc, k - j0);
     const r = await solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt);
     rowToCol(n, m, r.x, x, j0);
     relres.set(r.relres, j0);
     floor.set(r.floor, j0);
+    for (let j = 0; j < m; j++) stopped[j0 + j] = r.why[j];
     iters += r.iters;
     refinements = Math.max(refinements, r.refinements);
     gpuMs += r.gpuMs;
@@ -579,9 +630,13 @@ async function solveImpl(gpu, o) {
     history.push(r.history);
   }
   let converged = true;
-  for (let j = 0; j < k; j++) if (!(relres[j] <= tol)) converged = false;
+  let tolMet = true;
+  for (let j = 0; j < k; j++) {
+    if (!(relres[j] <= tol)) tolMet = false;
+    if (!(relres[j] <= Math.max(tol, opt.floorFactor * floor[j]))) converged = false;
+  }
   return {
-    x, iters, refinements, relres, ms: now() - t0, converged, floor,
+    x, iters, refinements, relres, ms: now() - t0, converged, tolMet, floor, stopped,
     precond: opt.precond, setupMs: fresh ? prep.setupMs : 0, gpuMs, cpuMs,
     fsaiFails: prep.fsaiFails, chunks: nchunks, history: nchunks === 1 ? history[0] : history,
   };

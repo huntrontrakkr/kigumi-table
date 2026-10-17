@@ -190,8 +190,15 @@ export function transposeCSR(n, ptr, idx, val) {
   return { ptr: tptr, idx: tidx, val: tval };
 }
 
-/** r = b - A x in float64, all blocks row-major n x k. */
-export function residualRowMajor(n, k, indptr, indices, data, x, b, r) {
+/**
+ * r = b - A x in float64, all blocks row-major n x k.  With `floor` (a
+ * Float64Array(k)), also the float64 attainable-residual estimate per column,
+ *   floor_j = u || |A||x_j| + |b_j| || / ||b_j||      (u = 2^-53),
+ * in the same pass: below about this, any residual evaluated in float64 is
+ * rounding noise, whatever the solver (direct solvers land at 0.5-3x it).
+ */
+export function residualRowMajor(n, k, indptr, indices, data, x, b, r, floor = null) {
+  if (floor) return residualAndFloor(n, k, indptr, indices, data, x, b, r, floor);
   if (k === 1) {
     for (let i = 0; i < n; i++) {
       let acc = 0;
@@ -214,33 +221,36 @@ export function residualRowMajor(n, k, indptr, indices, data, x, b, r) {
   return r;
 }
 
-/**
- * Float64 attainable-residual estimate per column, u * || |A||x| + |b| || / ||b||
- * (u = 2^-53): below about this, a residual b - A x evaluated in float64 is
- * rounding noise, whatever the solver.  Row-major n x k blocks.
- */
-export function residualFloorRowMajor(n, k, indptr, indices, data, x, b) {
+function residualAndFloor(n, k, indptr, indices, data, x, b, r, floor) {
   const u = 2 ** -53;
   const acc = new Float64Array(k);
+  const abs = new Float64Array(k);
   const num = new Float64Array(k);
   const den = new Float64Array(k);
   for (let i = 0; i < n; i++) {
     acc.fill(0);
+    abs.fill(0);
     for (let p = indptr[i]; p < indptr[i + 1]; p++) {
-      const a = Math.abs(data[p]);
+      const a = data[p];
+      const aa = Math.abs(a);
       const base = indices[p] * k;
-      for (let j = 0; j < k; j++) acc[j] += a * Math.abs(x[base + j]);
+      for (let j = 0; j < k; j++) {
+        const xv = x[base + j];
+        acc[j] += a * xv;
+        abs[j] += aa * Math.abs(xv);
+      }
     }
     const o = i * k;
     for (let j = 0; j < k; j++) {
-      const t = acc[j] + Math.abs(b[o + j]);
+      const bv = b[o + j];
+      r[o + j] = bv - acc[j];
+      const t = abs[j] + Math.abs(bv);
       num[j] += t * t;
-      den[j] += b[o + j] * b[o + j];
+      den[j] += bv * bv;
     }
   }
-  const out = new Float64Array(k);
-  for (let j = 0; j < k; j++) out[j] = u * Math.sqrt(num[j]) / (den[j] > 0 ? Math.sqrt(den[j]) : 1);
-  return out;
+  for (let j = 0; j < k; j++) floor[j] = u * Math.sqrt(num[j]) / (den[j] > 0 ? Math.sqrt(den[j]) : 1);
+  return r;
 }
 
 /** Euclidean norms of the k columns of a row-major n x k block. */

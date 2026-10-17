@@ -57,7 +57,8 @@ function score(item, c, r) {
     id: item.id, name: c.name, n, nnz: c.indptr[n], k, precond: r.precond,
     iters: r.iters, refinements: r.refinements, relresMax, errMax, floorMax,
     converged: r.converged, ms: r.ms, setupMs: r.setupMs, gpuMs: r.gpuMs, cpuMs: r.cpuMs,
-    perRefinement: hist.map((h) => ({ relres: h.relres, iters: h.iters, innerRel: h.innerRel, stagnated: h.stagnated })),
+    perRefinement: hist.map((h) => ({ relres: h.relres, iters: h.iters, innerRel: h.innerRel, stagnated: h.stagnated, cols: h.cols })),
+    stopped: r.stopped && r.stopped.length <= 16 ? r.stopped : undefined, tolMet: r.tolMet,
     accept: acc || null, pass, note: item.note || c.note,
   };
 }
@@ -91,7 +92,7 @@ function plan(params, manifest) {
     items.push({ id: 'plate_four_x0', group: 'model', accept: ACCEPT,
       note: 'warm start: x0 = reference + 1e-4 relative perturbation',
       x0: (c) => { const x = Float64Array.from(c.xref); for (let i = 0; i < x.length; i++) x[i] *= 1 + 1e-4 * Math.sin(i); return x; },
-      make: () => exported('plate_four') });
+      make: async () => ({ ...(await exported('plate_four')), name: 'plate_four (warm x0)' }) });
   }
   if (meta.grillage_four) items.push({ id: 'grillage_four', group: 'model', accept: ACCEPT, make: () => exported('grillage_four') });
   if (meta.plate_big) {
