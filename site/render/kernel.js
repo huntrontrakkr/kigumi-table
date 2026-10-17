@@ -741,7 +741,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 export const resolveWGSL = /* wgsl */`
-struct R { size: vec4u, k: vec4f }     // width, height, -, -; -, exposure, dither, -
+struct R { size: vec4u, k: vec4f }     // width, height, step, -; -, exposure, dither, -
 @group(0) @binding(0) var<uniform> U: R;
 @group(0) @binding(1) var<storage, read> accum: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> outPx: array<u32>;
@@ -773,10 +773,14 @@ fn hash1(x: u32) -> u32 {
   return v;
 }
 
+// step > 1: a preview, every step-th pixel, packed at (width / step) per row
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  if (gid.x >= U.size.x || gid.y >= U.size.y) { return; }
-  let i = gid.y * U.size.x + gid.x;
+  let st = max(U.size.z, 1u);
+  let ow = (U.size.x + st - 1u) / st;
+  let oh = (U.size.y + st - 1u) / st;
+  if (gid.x >= ow || gid.y >= oh) { return; }
+  let i = (gid.y * st) * U.size.x + gid.x * st;
   let a = accum[i];
   let c = neutral(max(a.xyz * (U.k.y / max(a.w, 1.0)), vec3f(0.0)));
   let s = srgb(clamp(c, vec3f(0.0), vec3f(1.0))) * 255.0;
@@ -784,6 +788,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let h = hash1(i * 3u + 1u);
   let dz = (f32(h & 0xffffu) + f32(h >> 16u)) * (1.0 / 65536.0) - 1.0;
   let v = clamp(floor(s + 0.5 + dz * U.k.z), vec3f(0.0), vec3f(255.0));
-  outPx[i] = u32(v.x) | (u32(v.y) << 8u) | (u32(v.z) << 16u) | (255u << 24u);
+  outPx[gid.y * ow + gid.x] = u32(v.x) | (u32(v.y) << 8u) | (u32(v.z) << 16u) | (255u << 24u);
 }
 `;

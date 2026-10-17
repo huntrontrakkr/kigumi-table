@@ -3,6 +3,7 @@
 //   import { renderPhoto } from './render/pathtracer.js';
 //   const blob = await renderPhoto({ viewer, view: 'hero', onProgress: (frac, spp) => {} });
 //   if (!blob) { /* no WebGPU, scene over the caps, or the GPU was lost: raster photo */ }
+//   optional: onPreview: (bitmap, spp) => {}  the converging image about once a second
 //
 // Takes the visible meshes of viewer.model, builds a BVH on the CPU (bvh.js), and
 // path-traces them on the GPU (kernel.js) in a studio: a warm key light from
@@ -98,7 +99,8 @@ export async function disposePathTracer() {
 }
 
 async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = DEFAULTS.height, samples = DEFAULTS.samples,
-  budgetMs = DEFAULTS.budgetMs, maxTriangles = DEFAULTS.maxTriangles, onProgress, signal, studio = STUDIO, _wgsl, _dispatchMs } = {}) {
+  budgetMs = DEFAULTS.budgetMs, maxTriangles = DEFAULTS.maxTriangles, onProgress, onPreview, previewMs = 1000, previewWidth = 800,
+  signal, studio = STUDIO, _wgsl, _dispatchMs } = {}) {
   if (!viewer || !viewer.model) throw new Error('renderPhoto: the viewer has no model');
   const T0 = performance.now();
   const fail = (reason, extra = {}) => { lastStats = { reason, ...extra }; return null; };
@@ -170,6 +172,34 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
     if (mErr) return fail('out of GPU memory', { message: mErr.message });
     if (vErr) throw new Error('path tracer: ' + vErr.message);
     const T2 = performance.now();
+
+    // resolve the accumulation into bOut, every step-th pixel (step 1: the photo)
+    const ru = new Uint32Array(8), rf = new Float32Array(ru.buffer);
+    const resolveInto = (enc, step) => {
+      ru[0] = width; ru[1] = height; ru[2] = step;
+      rf[5] = lights.exposure; rf[6] = 1;
+      device.queue.writeBuffer(bRes, 0, ru);
+      const pass = enc.beginComputePass();
+      pass.setPipeline(resolve);
+      pass.setBindGroup(0, bgResolve);
+      pass.dispatchWorkgroups(Math.ceil(Math.ceil(width / step) / 8), Math.ceil(Math.ceil(height / step) / 8));
+      pass.end();
+    };
+    // optional previews of the converging image (ImageBitmap, about previewWidth wide)
+    let lastPreview = performance.now();
+    const preview = async (sppDone) => {
+      const step = Math.max(1, Math.ceil(width / Math.max(64, previewWidth)));
+      const pw = Math.ceil(width / step), ph = Math.ceil(height / step);
+      const enc = device.createCommandEncoder();
+      resolveInto(enc, step);
+      enc.copyBufferToBuffer(bOut, 0, bRead, 0, pw * ph * 4);
+      device.queue.submit([enc.finish()]);
+      await bRead.mapAsync(GPUMapMode.READ, 0, pw * ph * 4);
+      const px = new Uint8ClampedArray(bRead.getMappedRange(0, pw * ph * 4).slice(0));
+      bRead.unmap();
+      lastPreview = performance.now();
+      if (typeof createImageBitmap === 'function') onPreview(await createImageBitmap(new ImageData(px, pw, ph)), sppDone);
+    };
 
     // ---- progressive passes
     const params = new ArrayBuffer(PARAMS_BYTES);
@@ -258,22 +288,17 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
         }
         s0 += m;
         report(spp + kk * s0 / nb);
+        if (onPreview && (spp > 0 || s0 >= nb) && performance.now() - lastPreview > previewMs) {
+          try { await preview(spp + (s0 >= nb ? kk : 0)); } catch (e) { if (lost.flag) return fail('GPU device lost', { dispatches, spp }); throw e; }
+        }
       }
       spp += kk;
     }
     const T3 = performance.now();
 
     // ---- resolve, read back, encode
-    const ru = new Uint32Array(8), rf = new Float32Array(ru.buffer);
-    ru[0] = width; ru[1] = height;
-    rf[5] = lights.exposure; rf[6] = 1;
-    device.queue.writeBuffer(bRes, 0, ru);
     const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(resolve);
-    pass.setBindGroup(0, bgResolve);
-    pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
-    pass.end();
+    resolveInto(enc, 1);
     enc.copyBufferToBuffer(bOut, 0, bRead, 0, pixels * 4);
     device.queue.submit([enc.finish()]);
     try {

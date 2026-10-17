@@ -25,6 +25,8 @@ const blob = await renderPhoto({
   budgetMs: 15000,                      // whole call; stops early with what it has
   maxTriangles,                         // default 3M (phones 500k): over it -> null
   onProgress: (frac, spp) => {},        // frac: max(samples done, budget spent)
+  onPreview: (bitmap, spp) => {},       // optional: the converging image as an ImageBitmap
+  previewMs: 1000, previewWidth: 800,   //   about once a second, about 800 px wide
   signal,                               // AbortSignal: rejects with AbortError
   studio,                               // optional, see STUDIO
 });
@@ -33,7 +35,9 @@ if (!blob) { /* lastStats.reason: no WebGPU, too many triangles, image too large
                 error -> use the raster viewer.photo() */ }
 ```
 
-It never rejects except on abort.  Renders are queued (one at a time).  The viewer's camera
+It never rejects except on abort.  Renders are queued (one at a time).  Phones (the UA's
+mobile flag or name, iPadOS, or a coarse pointer on a screen of 900 px or less, as the
+viewer's low-power test) get the smaller defaults; `MOBILE` and `DEFAULTS` are exported.  The viewer's camera
 is placed with `viewer.frame(false, pose)` at the photo's aspect and restored afterwards.
 `lastStats` holds the timings of the last render.  `disposePathTracer()` frees the device.
 
@@ -97,6 +101,8 @@ Default design: 172,692 triangles, 105 meshes; 1600 x 1100, 256 spp.
 | low | 2.8 s | 2.3 s | 9.1 | 106 (35) |
 | side | 2.7 s | 2.3 s | 8.9 | 107 (34) |
 | front | 3.5 s | 3.2 s | 12.7 | 151 (35) |
+
+Previews (`onPreview`, 800 x 550 every second) cost about 0.1 s over a whole render.
 
 Hero breakdown: extraction 34 ms, BVH 214 ms (worker), packing 14 ms, GPU setup 24 ms,
 tracing 3.5 s (about 130 M camera paths/s), resolve + readback + PNG 74 ms.  800 x 550,
