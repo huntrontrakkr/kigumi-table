@@ -1,7 +1,7 @@
 # Drive an already running headless Chrome (isolated profile, DevTools on 127.0.0.1:9223):
-# open a page, evaluate an async JS expression, screenshot.  Used from WSL to test
+# open a page (-Mobile: as a phone), evaluate an async JS expression, screenshot.  Used from WSL to test
 # the kigumi browser build on the real GPU.
-param([string]$Url, [string]$Expr, [string]$Shot = "C:\Temp\kigumi-shot.png", [int]$TimeoutS = 600)
+param([string]$Url, [string]$Expr, [string]$Shot = "C:\Temp\kigumi-shot.png", [int]$TimeoutS = 600, [switch]$Mobile)
 $ErrorActionPreference = "Stop"
 $t = Invoke-RestMethod -Method Put -Uri ("http://127.0.0.1:9223/json/new?" + $Url)
 $ws = New-Object System.Net.WebSockets.ClientWebSocket
@@ -28,6 +28,12 @@ function Send($method, $params) {
 }
 [void](Send "Page.enable" @{})
 [void](Send "Runtime.enable" @{})
+if ($Mobile) {
+  # a phone: 393 x 852 CSS px at 3x, touch input; then load the page again under it
+  [void](Send "Emulation.setDeviceMetricsOverride" @{ width = 393; height = 852; deviceScaleFactor = 3; mobile = $true })
+  [void](Send "Emulation.setTouchEmulationEnabled" @{ enabled = $true; maxTouchPoints = 5 })
+  [void](Send "Page.reload" @{ ignoreCache = $false })
+}
 Start-Sleep -Seconds 2
 $res = Send "Runtime.evaluate" @{ expression = $Expr; awaitPromise = $true; returnByValue = $true; timeout = ($TimeoutS * 1000) }
 if ($res.result.exceptionDetails) { Write-Output ("EXCEPTION: " + ($res.result.exceptionDetails | ConvertTo-Json -Depth 6 -Compress)) }
