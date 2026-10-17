@@ -1,22 +1,65 @@
 # kigumi table
 
-Generative, nail-free coffee tables in the spirit of Japanese joinery (*kigumi*, 木組み):
+Generative, nail-free coffee tables in the spirit of Japanese joinery (*kigumi*, 木組み). Pick
+legs, a field, a grid; the program lays out a flat lattice of notched strips, works out every
+joint, checks that the table stands up, and writes the files a workshop needs to make it.
 
-* **Legs** are turned, almost straight stems with a fat rounded foot and a flared capital.
+**[Open the configurator →](https://huntrontrakkr.github.io/kigumi-table/)** It runs entirely in your
+browser: the Python design engine in WebAssembly, the structural solver and the renderer on your GPU
+(WebGPU).
+
+![Configurator](docs/images/configurator.jpg)
+
+* **Legs** are turned, almost straight stems with a fat rounded foot and a flared capital. They can
+  stand on a ring, a square or a rectangle, or on organic layouts: a sunflower spiral, scattered
+  points, a meander, or points you type in. Each leg can also vary on its own.
 * **Radiance field.** Every leg radiates a circular field. The fields combine with a smooth
   minimum (2D metaballs, like smooth union in an SDF shader), so one leg alone makes a perfect
-  circle and neighbouring legs fuse into one organic blob. The zero contour is the glass outline.
+  circle and neighbouring legs fuse into one organic blob. That contour is the glass outline.
 * **Lattice.** Thin strips are notched into each other so the top is one flat plane (a kumiko-like
-  grid). The grid squares are kept whole where they fall inside the field ("cells" edge) or cut on
-  the curve ("smooth"). Under the plane, bracket tiers (tokyō, 斗栱) grow outward from each leg
-  along deeper level sets of the same field: separate little bracket sets near the legs that merge
-  as they rise.
+  grid): squares, kagome hexagons and triangles (two strips per crossing), or a mitsukude triangle
+  grid (three at every node). Under it, bracket tiers (tokyō, 斗栱) step out from the legs, chosen
+  by load (see below).
 * **No glue, no nails.** Every joint is a lap, slot or hole derived automatically. Each leg's
-  threaded post rises through an open shaft in the grid (an igeta, 井, of four strips), through the
-  glass, and a cap (rokuyō flower, dome, hōju jewel, mushroom, octagon roof) screws down and clamps
-  the whole stack.
+  threaded post rises through an open shaft in the grid (an igeta, 井), through the glass, and a cap
+  (rokuyō flower, dome, hōju jewel, mushroom, octagon roof) screws down and clamps the whole stack.
+* **Structure decides.** The top is solved as a plate under a person's weight placed all over it.
+  The grid turns to the direction that needs the least strip. The bracket tiers hold the lines
+  that carry the most bending: the lowest tiers take the main load paths, and every tier up adds
+  the next. Checks (grillage finite elements with the glass as a real plate on its pads, notch
+  depths, tipping, glass rules) put numbers on every design.
 
-## Run
+![Organic forms](docs/images/organic-forms.jpg)
+
+## The browser build
+
+`site/` is static files (GitHub Pages serves it). Nothing runs on a server:
+
+* **Engine.** The Python package runs in a Web Worker under [Pyodide](https://pyodide.org) (CPython
+  compiled to WebAssembly) with numpy, scipy, shapely and contourpy. The first visit downloads about
+  40 MB; later visits come from the browser cache.
+* **Solids.** [Manifold](https://github.com/elalish/manifold)'s WebAssembly build makes the solids and
+  booleans; `kigumi/_m3d_web.py` shims the subset of the `manifold3d` API that the package uses.
+* **Solver.** Large linear systems (the plate, the structural grillage) go to a WebGPU solver
+  (`site/engine/gpu/`). It runs conjugate gradients in WGSL on the GPU with a sparse approximate
+  inverse preconditioner, refined in double precision on the CPU. Python waits on the GPU through
+  JavaScript Promise Integration. Without WebGPU, the solves stay on SuperLU in WebAssembly.
+* **Rendering.** three.js `WebGPURenderer`, with the procedural wood written in TSL (compiled to
+  WGSL, or GLSL on the WebGL2 fallback). **Render photo** path-traces the scene on the GPU
+  (`site/render/`) instead of Blender.
+* **Export.** The fabrication package comes as a zip: CNC strip sheets (DXF), glass DXF,
+  drawings, cut list, `FABRICATION.md`, GLB and STL. STEP and Rhino `.3dm` come from the Python
+  package on your own machine.
+
+Best in a current Chrome or Edge (WebGPU and JS Promise Integration). Other browsers fall back to
+WebGL2 and CPU solves.
+
+Develop locally: `uv run python scripts/build_site.py` (packs the Python sources into
+`site/py/kigumi.zip`), then serve `site/` with any static server, e.g. `python3 -m http.server -d site`.
+`tools/web-engine-test/run.mjs` runs the same engine under Node, and `tools/gpu-test/` tests the GPU
+solver.
+
+## Run locally (Python)
 
 ```bash
 uv run python -m kigumi.server            # configurator at http://localhost:8765
@@ -24,6 +67,7 @@ uv run python scripts/render_one.py temple-round hero top     # Blender Cycles r
 uv run python scripts/sheet.py out/sheet.png hero '{}' '{"leg_count":3}'   # side-by-side variants
 uv run python scripts/plan.py out/plan.png '{}' '{"leg_count":1}'          # plan diagnostics (fast)
 uv run python scripts/partition.py out/p.png '{}' '{"preset":"field-pedestal"}'  # the kd-tree, strips by level
+uv run python scripts/organic.py out/organic 4                    # asymmetric organic designs, rendered
 uv run python scripts/gallery.py out/gallery.png 6               # search + render 12 sound designs
 uv run python scripts/sweep.py 40                                 # robustness: build + check many
 ```
@@ -49,7 +93,12 @@ then `kigumi.fab.export_all(d, "out/export/mine")` for the fabrication package.
    rests on two earlier beams (a leg capital counts as two), each reachable within its cantilever
    limit. Lines of a parallel tier at the same height either stack (a bracket arm under its beam)
    or keep clear.
-   * **Tree spacing (`spacing="tree"`, the default; `partition.py`).** The flat top is a kd-tree of
+   * **Uniform top, tiered brackets (`spacing="uniform"`, the default).** The top grid is
+     even, laid through the lines framing the posts. The bracket tiers below are chosen by load
+     (`tier_load`): each tier keeps its share of the grid lines that carry the most bending along
+     their length (the plate's design moment for that direction). The lowest tiers hold the main
+     load paths, and the arms reach only as far as the bending does.
+   * **Tree spacing (`spacing="tree"`; `partition.py`).** The flat top is a kd-tree of
      cells. The lines framing the posts are the roots. A cell is split across its longest side while
      it is wider than the local target. That target follows a fully stressed grillage: strips are
      spaced inversely to the moment they carry, `s = pitch (m_ref / m)^load_refine`. Strips end up
@@ -149,12 +198,17 @@ kagome cannot be refined locally:
 * halving it, or nesting a finer one inside, always creates three-strip points;
 * so does warping its spacing.
 
-That is why hex tops stay at one pitch. Their grid direction is set by fitting the posts into
-hexagons; the structural choice of angle applies to square grids only.
+That is why hex tops stay at one even pitch, with the structure in the bracket tiers underneath.
+Their grid direction is chosen from the two that keep the legs' symmetry, whichever seats the posts
+in cells.
+
+`hex_joint="mitsukude"` is the other way: a triangle grid with three strips crossing at every node,
+as in kumiko *mitsukude* work. Each strip keeps a third of its depth there, so the joints are
+weaker (the notch check says so). The posts rise through triangles.
 
 `hex_motif` ("star" or "ring") is an experiment: it refines whole hexagons in place, which keeps
-every joint two-way. With 18 mm strips it needs a kagome pitch near 190 mm, which is too coarse for a
-one-metre top. A true hierarchical hex pattern would need kumiko-style three-way joints (*mitsukude*).
+every joint two-way. With 18 mm strips it needs a kagome pitch near 190 mm, too coarse for a
+one-metre top.
 
 ## Notes and limits
 
@@ -164,6 +218,20 @@ one-metre top. A true hierarchical hex pattern would need kumiko-style three-way
   level of cells.
 * The radial (pinwheel and ring) grammar predates the open-shaft leg joint, so it is left out of
   random sampling.
-* Front-end tests: `cd tools/ui-test && node ui-test.mjs --url http://127.0.0.1:8765/ --quick`.
+* **Organic layouts need checking.** Spiral, scatter, wave and free layouts are asymmetric by
+  nature. Where the outline reaches far past the feet, the table can tip under a hand on the rim,
+  and the tipping check flags it. Pull the field in, lean the feet out, or add a leg.
+* Front-end tests: `cd tools/ui-test && node ui-test.mjs --url http://127.0.0.1:8765/ --quick`
+  (local server) and `node site-smoke.mjs --url http://localhost:8790/` (browser build).
 * Wood moves across the grain, so notches are cut with 0.15 mm clearance a side and the caps can be
   re-snugged seasonally.
+
+## Credits
+
+three.js (MIT), Manifold (Apache-2.0), Pyodide (MPL-2.0) with numpy, scipy, shapely and contourpy
+(BSD). The Python package also uses build123d, rhino3dm, ezdxf and matplotlib for the local
+fabrication exports, and Blender for offline renders.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
