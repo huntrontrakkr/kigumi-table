@@ -543,7 +543,7 @@ fn clampInd(c: vec3f, indirect: bool) -> vec3f {
 }
 
 fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
-  let j = rand2(si, dimSeed(pix, 31u, 0u));
+  let j = rand2(si, hash1(pix ^ 0x5bd1e995u));
   let sx = (f32(px) + 0.5 + tent(j.x)) / f32(P.size.x) * 2.0 - 1.0;
   let sy = 1.0 - (f32(py) + 0.5 + tent(j.y)) / f32(P.size.y) * 2.0;
   var d = normalize(P.camFwd.xyz + P.camRight.xyz * sx + P.camUp.xyz * sy);
@@ -551,6 +551,7 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
   var L = vec3f(0.0);
   var beta = vec3f(1.0);
   var specPath = true;          // only mirror / refraction events since the camera
+  var mirrored = false;         // ... and one of them a reflection
   var lastPdf = 0.0;            // BSDF pdf at the last rough vertex; 0: delta event or camera
   var inGlass = false;
   var sigma = vec3f(0.0);
@@ -563,8 +564,13 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
     if (d.y < 0.0) { tFloor = (P.floorA.w - o.y) / d.y; }
     let onTri = h.tri != NONE && h.t < tFloor;
     if (!onTri && tFloor >= BIG) {
-      var Le = select(envL(d), P.backdrop.xyz, specPath);
-      if (depth > 0u) {
+      // straight through glass from the camera: the backdrop paper; reflections
+      // and everything lit indirectly: the studio around it
+      var Le = select(envL(d), P.backdrop.xyz, specPath && !mirrored);
+      // the lights: seen in the glass from the camera, or reached from a rough
+      // surface (MIS with next-event estimation); not after rough -> mirror
+      // (reflective caustics off the glass: faint, and all fireflies)
+      if (depth > 0u && (specPath || lastPdf > 0.0)) {
         Le += coneLe(d, P.keyDir, P.keyL.xyz, P.keyL.w, lastPdf);
         Le += coneLe(d, P.fillDir, P.fillL.xyz, 1.0 - P.keyL.w, lastPdf);
       }
@@ -607,6 +613,7 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
           if (dot(d, ng) <= 0.0) { d = reflect(d, ng); }
           o = offsetRay(p, ng);
           lastPdf = 0.0;
+          mirrored = true;
         } else {
           d = refract(d, n, eta);
           if (dot(d, ng) >= 0.0) { break; }

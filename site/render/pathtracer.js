@@ -25,17 +25,22 @@ export const POSES = {
 
 // Studio, in the units of the live view (a white surface square to the key light
 // at 1 gets radiance 1/pi).  Irradiances at normal incidence; colours have unit
-// luminance and are scaled by the levels.
+// luminance and are scaled by the levels.  The key is a distant disc light: its
+// angular size sets the softness of the shadows (at 1.5 degrees the lattice still
+// draws its pattern on the floor, with penumbrae widening away from the parts;
+// 8-10 degrees is a big softbox nearby and washes the pattern out).  The floor's
+// colour is solved from these levels, so they change the table, not the paper.
 export const STUDIO = {
-  key: { E: 2.6, color: [1.0, 0.95, 0.87], halfAngle: 10 },
+  key: { E: 2.8, color: [1.0, 0.95, 0.87], halfAngle: 1.5 },
   fill: { E: 0.5, color: [0.86, 0.94, 1.08], halfAngle: 24, elevation: 26 },
-  env: { horizon: 0.40, zenith: 0.56 },       // radiance, tinted by the background colour
-  clamp: 12,                                   // max radiance of an indirect sample
+  env: { horizon: 0.7, zenith: 0.95 },        // radiance, tinted by the background colour
+  clamp: 4,                                    // max radiance of an indirect sample
   bump: 1,
 };
 
 const TARGET_MS = 110;            // GPU time per submission (keeps the browser responsive)
-const MAX_EVENTS = 24;            // path vertices including glass interfaces
+const MAX_EVENTS = 128;           // path vertices including glass interfaces (light entering a
+                                  // sheet's edge runs along it by total internal reflection)
 
 export let lastStats = null;
 

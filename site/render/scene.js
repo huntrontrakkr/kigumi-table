@@ -29,11 +29,9 @@ function convertMaterial(mat) {
   const sc = mat?.specularColor ? (mat.specularColor.r + mat.specularColor.g + mat.specularColor.b) / 3 : 1;
   const f0d = Math.min(1, ((ior - 1) / (ior + 1)) ** 2 * sc) * specI;
   const cc = num(mat?.clearcoat, 0);
-  const name = mat?.name || '';
-  const transmissive = num(mat?.transmission, 0) > 0.5 || name === 'glass' || name === 'acrylic' || name === 'glass-edge';
   r[1] = rough; r[3] = metal;
   r.set(col, 4); r[7] = ior;
-  if (transmissive) {
+  if (isGlass(mat)) {
     r[0] = KIND.GLASS;
     r[2] = f0d;
     const ad = num(mat?.attenuationDistance, Infinity);
@@ -63,6 +61,11 @@ function convertMaterial(mat) {
   }
   r[0] = KIND.PLASTIC;
   return r;
+}
+
+function isGlass(mat) {
+  const name = mat?.name || '';
+  return num(mat?.transmission, 0) > 0.5 || name === 'glass' || name === 'acrylic' || name === 'glass-edge';
 }
 
 function num(v, d) { return typeof v === 'number' && isFinite(v) ? v : d; }
@@ -116,9 +119,15 @@ export function extractScene(root) {
     const P = g.attributes.position, NA = g.attributes.normal;
     const I = g.index;
     const mats = Array.isArray(it.mesh.material) ? it.mesh.material : [it.mesh.material];
+    // a glass sheet's edges are the same glass body as its faces: one medium (the
+    // live view's darker 'glass-edge' material stands in for the long path along
+    // the sheet, which the path tracer follows for real)
+    const face = mats.find((m) => isGlass(m) && m.name !== 'glass-edge');
     const vert = new Float64Array(9), nv = new Float64Array(9);
     for (const range of triRanges(it.mesh)) {
-      const mid = matId(mats[range.material] || mats[0]);
+      let m = mats[range.material] || mats[0];
+      if (face && m && m.name === 'glass-edge') m = face;
+      const mid = matId(m);
       if (mid > 65535) throw new Error('too many materials for the path tracer');
       for (let f = range.start; f < range.start + range.count; f++) {
         for (let c = 0; c < 3; c++) {
