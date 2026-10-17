@@ -781,7 +781,7 @@ def legs_turnable(p) -> bool:
     return straight and p.leg_sweep == 0 and p.leg_swirl == 0 and p.leg_capital == "round"
 
 
-def fabrication_md(d: Design, cnc: dict, checks: list) -> str:
+def fabrication_md(d: Design, cnc: dict, checks: list, cad: bool = True) -> str:
     p = d.p
     lay = d.layout
     bdft = lambda mm3: mm3 / 2359737.0          # board feet
@@ -866,10 +866,17 @@ def fabrication_md(d: Design, cnc: dict, checks: list) -> str:
             L.append(f"* fix: {c['name']} - {c['detail']}")
         for c in warns:
             L.append(f"* consider: {c['name']} - {c['detail']}")
-    return "\n".join(L) + "\n"
+    md = "\n".join(L) + "\n"
+    if not cad:         # made in the browser: the exact solids come from the Python package
+        md = md.replace("table.step", "table.step (Python package)")
+        md = md.replace("\n## Who makes what", "\nMade in the browser. The exact solids (table.step, table.3dm) come from the "
+                        "Python package: `uv run python -m kigumi.server`, then Export.\n\n## Who makes what", 1)
+    return md
 
 
-def export_all(d: Design, folder: Path, step: bool = True) -> Path:
+def export_all(d: Design, folder: Path, step: bool = True, cad: bool = True) -> Path:
+    """The fabrication package in `folder`.  cad=False leaves out the Rhino and
+    STEP solids (they need native libraries: the browser build has neither)."""
     from .checks import run_checks
     from .report import summarize
     folder = Path(folder)
@@ -881,15 +888,16 @@ def export_all(d: Design, folder: Path, step: bool = True) -> Path:
     (folder / "report.json").write_text(json.dumps(rep, indent=1, default=float))
     export_glb(d, folder / "table.glb")
     export_stl(d, folder / "table.stl")
-    export_3dm(d, folder / "table.3dm")
+    if cad:
+        export_3dm(d, folder / "table.3dm")
     export_glass_dxf(d, folder / "glass.dxf")
     export_beams_dxf(d, folder / "beams.dxf")
     export_cutlist(d, folder / "cutlist.csv")
     export_drawings(d, folder / "drawings.pdf", checks)
     export_assembly(d, folder / "assembly.md", rep["assembly"])
     cnc = export_cnc(d, folder)
-    (folder / "FABRICATION.md").write_text(fabrication_md(d, cnc, checks))
-    if step:
+    (folder / "FABRICATION.md").write_text(fabrication_md(d, cnc, checks, cad=cad))
+    if step and cad:
         try:
             export_step(d, folder / "table.step")
         except Exception as e:  # noqa: keep the rest even if OCC trips

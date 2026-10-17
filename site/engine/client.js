@@ -60,7 +60,10 @@ export const engine = {
   start() {
     if (!this.ready) {
       const base = new URL('../', import.meta.url).href;
-      this.ready = call('init', { base }).then((s) => (this.status = s));
+      // the WebGPU solver is opt-in: for these plate systems SuperLU in
+      // WebAssembly is 3-9x faster (tools/gpu-test/NOTES.md)
+      const gpuSolver = new URLSearchParams(location.search).has('gpu-solver');
+      this.ready = call('init', { base, gpuSolver }).then((s) => (this.status = s));
     }
     return this.ready;
   },
@@ -80,6 +83,7 @@ export const engine = {
       return { files: [{ url: URL.createObjectURL(new Blob([r.zip], { type: 'application/zip' })), name }] };
     }
     if (path === '/api/stats') return JSON.parse(await queued('stats'));
+    if (path === '/api/profile') return queued('profile', { body });
     throw new Error('unknown request ' + path);
   },
 };

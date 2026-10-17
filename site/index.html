@@ -76,6 +76,14 @@
 
 <aside class="panel report" id="report" aria-label="Design report"></aside>
 
+<!-- phones: the panels open as a sheet under (or beside) the view -->
+<nav class="tabbar" id="tabbar" aria-label="Panels">
+  <button type="button" data-tab="design" aria-selected="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.1"/><circle cx="5" cy="4" r="1.6" fill="var(--paper)" stroke="currentColor" stroke-width="1.1"/><circle cx="10.5" cy="8" r="1.6" fill="var(--paper)" stroke="currentColor" stroke-width="1.1"/><circle cx="7" cy="12" r="1.6" fill="var(--paper)" stroke="currentColor" stroke-width="1.1"/></svg><span>Design</span></button>
+  <button type="button" data-tab="report" aria-selected="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.2l1.2 1.2 2-2.4M2.5 8.7l1.2 1.2 2-2.4M2.5 13.2l1.2 1.2 2-2.4M8 4.5h6M8 9h6M8 13.5h6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Report</span><i class="tabdot" id="tab-dot" aria-hidden="true"></i></button>
+  <button type="button" id="tab-photo"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 5h2.6l1.2-1.8h4.4L11.4 5H14v8H2z" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><circle cx="8" cy="9" r="2.4" fill="none" stroke="currentColor" stroke-width="1.1"/></svg><span>Photo</span></button>
+  <button type="button" id="tab-export"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.8 6.8 8 10l3.2-3.2M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Export</span></button>
+</nav>
+
 <div class="boot" id="boot" role="status" aria-live="polite">
   <div class="boot-card">
     <svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" fill="none" stroke="currentColor"/><path d="M1.5 6h13M1.5 10h13M6 1.5v13M10 1.5v13" stroke="currentColor" stroke-width=".7"/></svg>

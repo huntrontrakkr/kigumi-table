@@ -11,7 +11,7 @@ import zipfile
 from collections import OrderedDict
 
 from .build import build as _build
-from .export import glb_bytes, stl_bytes
+from .export import glb_bytes
 from .params import PRESETS, Params, preset, schema as _schema
 from .report import summarize
 
@@ -97,11 +97,10 @@ def export(params_json: str) -> bytes:
     p = Params.from_dict(body.get("params", body))
     e = _entry(p)
     with tempfile.TemporaryDirectory() as td:
-        folder = export_all(e["design"], Path(td) / e["id"])
+        folder = export_all(e["design"], Path(td) / e["id"], cad=False)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for f in sorted(Path(folder).rglob("*")):
                 if f.is_file():
                     z.write(f, f"kigumi-{e['id']}/{f.relative_to(folder)}")
-            z.writestr(f"kigumi-{e['id']}/table.stl", stl_bytes(e["design"]))
         return buf.getvalue()

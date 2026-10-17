@@ -575,6 +575,11 @@ function checksHtml(checks, failure, waiting) {
 function renderChecks(checks, failure) {
   const sec = $('#checks-sec');
   if (sec) sec.innerHTML = checksHtml(checks || [], failure, false);
+  const dot = $('#tab-dot');
+  if (dot) {
+    const st = (checks || []).map((c) => c.status);
+    dot.className = 'tabdot' + (st.includes('fail') ? ' fail' : st.includes('warn') ? ' warn' : '');
+  }
 }
 
 function renderReport(rep, id) {
@@ -787,6 +792,8 @@ function showTip(id, ptr) {
   const tw = tip.offsetWidth, th = tip.offsetHeight;
   if (x + tw > stage.width - 8) x = ptr.cx - stage.left - tw - 12;
   if (y + th > stage.height - 70) y = ptr.cy - stage.top - th - 12;
+  x = Math.max(8, Math.min(x, stage.width - tw - 8));          // small screens: keep it inside
+  y = Math.max(8, Math.min(y, stage.height - th - 8));
   tip.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
 }
 
@@ -797,10 +804,24 @@ let lightboxMode = '';
 let photoTimer = null;
 const paramsKey = () => JSON.stringify(state.params);
 
+function setWorking(what, on) {
+  for (const el of [$(`#btn-${what}`), $(what === 'render' ? '#tab-photo' : '#tab-export')]) el?.classList.toggle('working', on);
+}
+
+// phones: the tab bar opens the parameters or the report as a sheet (a second
+// tap on the open tab closes it)
+function setSheet(name) {
+  const next = name && name !== document.body.dataset.sheet ? name : '';
+  if (next) document.body.dataset.sheet = next;
+  else delete document.body.dataset.sheet;
+  $$('#tabbar [data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === next)));
+  requestAnimationFrame(() => viewer?.refit(true));        // the view changed size
+}
+
 async function renderPhoto(view = 'hero') {
   if (photo.busy) { showPhotoBox(); return; }
   Object.assign(photo, { busy: true, view, url: null, error: null, trace: null, t0: performance.now(), key: paramsKey() });
-  $('#btn-render').classList.add('working');
+  setWorking('render', true);
   showPhotoBox();
   clearInterval(photoTimer);
   photoTimer = setInterval(() => {
@@ -816,7 +837,7 @@ async function renderPhoto(view = 'hero') {
   } finally {
     photo.busy = false;
     clearInterval(photoTimer);
-    $('#btn-render').classList.remove('working');
+    setWorking('render', false);
     if (lightboxMode === 'photo' && !$('#lightbox').hidden) showPhotoBox();
     else if (photo.url) showToast('Photo ready — press Render photo to see it.', 'info');
     else showToast('Render failed: ' + photo.error, 'error', photo.trace);
@@ -856,7 +877,7 @@ async function exportFiles() {
   exporting.ok = false;
   exporting.key = paramsKey();
   exporting.t0 = performance.now();
-  $('#btn-export').classList.add('working');
+  setWorking('export', true);
   showExportBox();
   const timer = setInterval(() => {
     const el = $('#lb-elapsed');
@@ -884,7 +905,7 @@ async function exportFiles() {
   } finally {
     clearInterval(timer);
     exporting.busy = false;
-    $('#btn-export').classList.remove('working');
+    setWorking('export', false);
     if (lightboxMode === 'export' && !$('#lightbox').hidden) showExportBox();
     else if (exporting.ok) showToast('Export finished — press Export to see the files.', 'info');
     else showToast("The export didn't finish — press Export for details.", 'error');
@@ -939,6 +960,9 @@ function wire() {
     if (e.key === 'Escape') { e.stopPropagation(); filter.value = ''; applyFilter(''); filter.blur(); }
   });
   $('#btn-frame').addEventListener('click', () => viewer.frame(true));
+  $$('#tabbar [data-tab]').forEach((b) => b.addEventListener('click', () => setSheet(b.dataset.tab)));
+  $('#tab-photo').addEventListener('click', () => $('#btn-render').click());
+  $('#tab-export').addEventListener('click', () => $('#btn-export').click());
   $('#lb-close').addEventListener('click', closeLightbox);
   $('#lightbox').addEventListener('click', (e) => { if (e.target.id === 'lightbox') closeLightbox(); });
 
@@ -1079,6 +1103,7 @@ window.kigumi = {
   randomize, mutate,
   setExplode(v) { const ex = $('#explode'); ex.value = String(v); ex.dispatchEvent(new Event('input')); },
   setStep(k) { const st = $('#step'); st.value = String(k); st.dispatchEvent(new Event('input')); },
+  setSheet,
   get viewer() { return viewer; },
 };
 

@@ -209,7 +209,11 @@ export class Viewer {
     // WebGPU where the browser has it, WebGL2 otherwise (three.js picks the backend)
     this.renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
     const r = this.renderer;
-    r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    // phones and small tablets: a smaller shadow map, and the frame governor
+    // (_loop) lowers the resolution while frames stay slow
+    this.lowPower = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) <= 900;
+    this.maxPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    r.setPixelRatio(this.maxPixelRatio);
     r.outputColorSpace = THREE.SRGBColorSpace;
     r.toneMapping = { aces: THREE.ACESFilmicToneMapping, neutral: THREE.NeutralToneMapping, agx: THREE.AgXToneMapping }[toneMapping] ?? THREE.NeutralToneMapping;
     r.toneMappingExposure = exposure;
@@ -240,7 +244,7 @@ export class Viewer {
     this.key = new THREE.DirectionalLight(0xfff6ec, 2.4);
     this.keyDir = new THREE.Vector3(-0.55, 1.0, 0.42).normalize();
     this.key.castShadow = true;
-    this.key.shadow.mapSize.set(2048, 2048);
+    this.key.shadow.mapSize.setScalar(this.lowPower ? 1024 : 2048);
     this.key.shadow.radius = 4;
     this.key.shadow.bias = -0.0004;
     this.key.shadow.normalBias = 0.0032;
@@ -330,8 +334,25 @@ export class Viewer {
       this.pointer = { x: e.clientX - rect.left, y: e.clientY - rect.top, w: rect.width, h: rect.height, cx: e.clientX, cy: e.clientY };
       this._pickPending = true;
     });
-    r.domElement.addEventListener('pointerleave', () => { this.pointer = null; this._pickPending = true; });
-    r.domElement.addEventListener('pointerdown', () => { this.pointer = null; this._pickPending = true; });
+    r.domElement.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'mouse') { this.pointer = null; this._pickPending = true; }
+    });
+    r.domElement.addEventListener('pointerdown', (e) => {
+      this.pointer = null;
+      this._pickPending = true;
+      this._down = { x: e.clientX, y: e.clientY, t: performance.now() };
+    });
+    // touch has no hover: a tap picks the part under the finger (a tap on the
+    // background clears it); a drag still orbits
+    r.domElement.addEventListener('pointerup', (e) => {
+      const d = this._down;
+      this._down = null;
+      if (!d || e.pointerType === 'mouse') return;
+      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 8 || performance.now() - d.t > 450) return;
+      const rect = r.domElement.getBoundingClientRect();
+      this.pointer = { x: e.clientX - rect.left, y: e.clientY - rect.top, w: rect.width, h: rect.height, cx: e.clientX, cy: e.clientY };
+      this._pickPending = true;
+    });
 
     this.loader = new GLTFLoader();
     this._resize();
@@ -387,9 +408,27 @@ export class Viewer {
       if (!this.backend) return;               // the renderer is still starting
       if (this._shadowDirty) { this.key.shadow.needsUpdate = true; this._shadowDirty = false; }
       this.renderer.render(this.scene, this.camera);
+      this._govern(now);
       this.onRendered?.();
     } else {
+      this._lastFrame = 0;
       this.onIdleFrame?.();
+    }
+  }
+  // While frames render back to back (orbiting, tweens), a slow GPU shows as long
+  // gaps between them: after a run of slow frames drop the resolution a step.
+  // Never steps back up (no oscillation); frames right after a model load (shader
+  // compiles) do not count.
+  _govern(now) {
+    const last = this._lastFrame;
+    this._lastFrame = now;
+    if (!last || now - (this._loadedAt || 0) < 1500) { this._slow = 0; return; }
+    this._slow = now - last > 45 ? (this._slow || 0) + 1 : 0;
+    const r = this.renderer;
+    if (this._slow >= 12 && r.getPixelRatio() > 1) {
+      r.setPixelRatio(Math.max(1, r.getPixelRatio() * 0.8));
+      this._slow = 0;
+      this._resize();
     }
   }
   tween(dur, fn, done) {
@@ -534,6 +573,7 @@ export class Viewer {
       });
     }
     this.model = group;
+    this._loadedAt = performance.now();
     this.parts = parts;
     this.steps = steps;
     this.restBox.copy(restBox);
@@ -659,6 +699,14 @@ export class Viewer {
   }
 
   // Frame the model: 3/4 view from the front-right, slightly elevated.
+  // Fit the table to the view again from the direction it is seen from now
+  // (after the view changed size: a sheet opened on a phone).
+  refit(animate = true) {
+    this._resize();
+    const off = this.camera.position.clone().sub(this.controls.target);
+    const s = new THREE.Spherical().setFromVector3(off);
+    this.frame(animate, { azimuth: s.theta * 180 / Math.PI, elevation: 90 - s.phi * 180 / Math.PI });
+  }
   frame(animate = false, { azimuth = 38, elevation = 24 } = {}) {
     const box = this.restBox.clone();
     if (box.isEmpty()) return;
@@ -723,14 +771,16 @@ export class Viewer {
   // ---------------------------------------------------------------- photo
   // A still at twice the screen resolution from one of the standard views,
   // rendered on the GPU; returns a PNG blob.
-  async photo({ view = 'hero', scale = 2 } = {}) {
+  async photo({ view = 'hero', scale = 2, maxSide = 2400 } = {}) {
     const poses = { hero: { azimuth: 38, elevation: 24 }, top: { azimuth: 0, elevation: 89 },
                     low: { azimuth: 25, elevation: 6 }, side: { azimuth: 90, elevation: 2 }, front: { azimuth: 0, elevation: 14 } };
     const r = this.renderer;
     const cam = this.camera;
     const keep = { pos: cam.position.clone(), target: this.controls.target.clone(), ratio: r.getPixelRatio() };
     this.frame(false, poses[view] || poses.hero);
-    r.setPixelRatio(keep.ratio * scale);
+    // at most maxSide pixels a side (phones have small screens at high density)
+    const side = Math.max(this.container.clientWidth, this.container.clientHeight, 1);
+    r.setPixelRatio(Math.min(keep.ratio * scale, maxSide / side));
     this._resize();
     await this.ready;
     this.key.shadow.needsUpdate = true;

@@ -1,7 +1,7 @@
 // The kigumi engine in a module worker: CPython (Pyodide, WebAssembly) running
-// the kigumi package, Manifold's WebAssembly build for the solids, and -- when
-// the browser has WebGPU and JS Promise Integration -- the WebGPU solver for
-// the large linear systems.  Messages: {id, op, args} -> {id, ok, result} | {id, ok:false, error}
+// the kigumi package, Manifold's WebAssembly build for the solids, and -- opt-in
+// with ?gpu-solver, when the browser has WebGPU and JS Promise Integration --
+// the WebGPU solver for the large linear systems.  Messages: {id, op, args} -> {id, ok, result} | {id, ok:false, error}
 // plus {type:'progress', text, frac} while loading.
 
 const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/';
@@ -9,11 +9,15 @@ const PACKAGES = ['numpy', 'scipy', 'shapely', 'contourpy'];
 
 let py = null;
 let api = null;
-const status = { gpu: null, jspi: false, packages: PACKAGES, pyodide: PYODIDE };
+// JS Promise Integration lets synchronous Python wait on the GPU (Chrome, Edge);
+// without it (Safari, iOS) Python is called directly and solves stay on the CPU
+const JSPI = 'Suspending' in WebAssembly || 'Suspender' in WebAssembly;
+const status = { gpu: null, jspi: JSPI, packages: PACKAGES, pyodide: PYODIDE };
+const callPy = (fn, ...args) => (JSPI ? fn.callPromising(...args) : fn(...args));
 
 const progress = (text, frac) => postMessage({ type: 'progress', text, frac });
 
-async function init(base) {
+async function init(base, gpuSolver = false) {
   progress('Loading Python (Pyodide, WebAssembly)…', 0.05);
   const { loadPyodide } = await import(PYODIDE + 'pyodide.mjs');
   py = await loadPyodide({ indexURL: PYODIDE });
@@ -31,8 +35,12 @@ async function init(base) {
   await py.runPythonAsync('import sys; sys.path.insert(0, "/home/pyodide"); import kigumi.webapi');
   api = py.pyimport('kigumi.webapi');
 
-  progress('Waking the GPU…', 0.9);
-  await initGpu();
+  if (gpuSolver) {
+    progress('Waking the GPU…', 0.9);
+    await initGpu();
+  } else {
+    status.gpu = 'solver off (SuperLU in WebAssembly is faster for these systems; ?gpu-solver turns it on)';
+  }
   progress('Ready', 1.0);
   return status;
 }
@@ -42,7 +50,6 @@ async function initGpu() {
   // (a synchronous Python call waits on the GPU's promise).  Without either,
   // the solves stay on the CPU (SuperLU in WebAssembly).
   try {
-    status.jspi = !!py.ffi?.can_run_sync?.() || (typeof WebAssembly.Suspending === 'function');
     const gpuMod = await import(new URL('./gpu/sparse.js', import.meta.url).href).catch(() => null);
     if (!gpuMod) { status.gpu = 'solver module missing'; return; }
     const gpu = await gpuMod.getGpu();
@@ -62,25 +69,26 @@ async function initGpu() {
 }
 
 const ops = {
-  async init({ base }) { return init(base); },
+  async init({ base, gpuSolver }) { return init(base, gpuSolver); },
   async schema() { return api.schema(); },
   async build({ body }) {
-    const r = await api.build.callPromising(JSON.stringify(body));
+    const r = await callPy(api.build, JSON.stringify(body));
     const [json, glb] = r.toJs();
     r.destroy?.();
     const bytes = glb.toJs ? glb.toJs() : glb;
     return { json, glb: bytes.buffer ? bytes : new Uint8Array(bytes) };
   },
-  async checks({ id }) { return api.checks.callPromising(id); },
+  async checks({ id }) { return callPy(api.checks, id); },
   async random({ body }) {
-    const r = await api.random.callPromising(JSON.stringify(body));
+    const r = await callPy(api.random, JSON.stringify(body));
     const [json, glb] = r.toJs();
     r.destroy?.();
     const bytes = glb.toJs ? glb.toJs() : glb;
     return { json, glb: bytes.buffer ? bytes : new Uint8Array(bytes) };
   },
   async export({ body }) {
-    await py.loadPackage(['micropip'], { messageCallback: () => {} });
+    // DXF (ezdxf, pure Python, from PyPI) and the PDF sheets (matplotlib)
+    await py.loadPackage(['micropip', 'matplotlib'], { messageCallback: () => {} });
     await py.runPythonAsync(`
 import micropip
 try:
@@ -88,12 +96,29 @@ try:
 except ImportError:
     await micropip.install("ezdxf")
 `);
-    const z = await api.export.callPromising(JSON.stringify(body));
+    const z = await callPy(api.export, JSON.stringify(body));
     const bytes = z.toJs ? z.toJs() : z;
     return { zip: bytes };
   },
+  // where a build spends its time (cProfile, top entries by cumulative time)
+  async profile({ body }) {
+    py.globals.set('_kg_body', JSON.stringify(body || {}));
+    return py.runPython(`
+import cProfile, io, pstats
+from kigumi import webapi
+_pr = cProfile.Profile()
+_pr.enable()
+webapi.build(_kg_body)
+_pr.disable()
+_s = io.StringIO()
+pstats.Stats(_pr, stream=_s).sort_stats("cumulative").print_stats(40)
+_s.getvalue()
+`);
+  },
   async stats() {
-    return py.runPython('import json; from kigumi.linalg import STATS; json.dumps(STATS)');
+    const s = JSON.parse(py.runPython('import json; from kigumi.linalg import STATS; json.dumps(STATS)'));
+    s.wasm_mb = Math.round((py._module?.HEAP8?.length || 0) / 2 ** 20);      // the Python heap
+    return JSON.stringify(s);
   },
 };
 

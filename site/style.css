@@ -581,3 +581,110 @@ code { font: 11.5px var(--mono); background: var(--paper-2); padding: 1px 4px; }
 .boot-bar { height: 3px; background: rgba(38, 35, 31, .12); border-radius: 2px; overflow: hidden; }
 .boot-bar span { display: block; height: 100%; width: 0; background: #26231f; transition: width .3s ease; }
 .boot-note { margin-top: 14px; font-size: 12px; opacity: .65; line-height: 1.45; }
+
+/* ------------------------------------------------------------------ phones
+   The view fills the screen; a tab bar at the bottom opens the parameters or
+   the report as a sheet under the view (beside it on a phone held sideways)
+   and starts a photo or an export. */
+.tabbar { display: none; }
+@media (max-width: 760px), (pointer: coarse) and (max-width: 1100px) and (orientation: portrait),
+       (pointer: coarse) and (max-height: 520px) {
+  :root { --top: 48px; --tabs: 52px; --sheet: 0px; }
+  body {
+    height: 100vh;
+    height: 100dvh;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: var(--top) minmax(0, 1fr) var(--sheet) calc(var(--tabs) + env(safe-area-inset-bottom, 0px));
+    grid-template-areas: "top" "stage" "sheet" "tabs";
+  }
+  body[data-sheet="design"], body[data-sheet="report"] { --sheet: min(50dvh, 460px); }
+
+  /* top bar: mark, preset, the generative buttons, undo and redo */
+  .topbar { gap: 8px; padding: 0 10px; }
+  .brand { min-width: 0; flex-shrink: 0; }
+  .brand .title, .sep, .seedbox, .actions, kbd, .topbar .flabel { display: none; }
+  .tools { flex: 1; min-width: 0; gap: 6px; }
+  .tools > .field { flex: 1 1 auto; min-width: 0; }
+  #preset { min-width: 0; width: 100%; max-width: 160px; }
+  .hist { margin-left: auto; }
+  .btn { height: 34px; padding: 0 10px; }
+  .icon { width: 34px; height: 34px; }
+  button { -webkit-tap-highlight-color: transparent; }
+  html, body { overscroll-behavior: none; touch-action: manipulation; }     /* no pull-to-refresh, no double-tap zoom */
+
+  /* the sheet */
+  .panel { grid-area: sheet; display: none; border: 0; border-top: 1px solid var(--hair); }
+  body[data-sheet="design"] .params, body[data-sheet="report"] .report { display: block; }
+  .params, .report { padding: 0 16px 28px; overscroll-behavior: contain; }
+
+  .tabbar {
+    grid-area: tabs;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 1px solid var(--hair);
+    background: rgba(243, 239, 230, 0.94);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .tabbar button {
+    position: relative;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    background: none; border: 0; padding: 0;
+    color: var(--ink-2); font-size: 11px; letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .tabbar svg { width: 20px; height: 20px; }
+  .tabbar button[aria-selected="true"] { color: var(--accent); }
+  .tabbar button.working { color: var(--accent); }
+  .tabbar button.working svg { animation: pulse 1.1s ease-in-out infinite; }
+  .tabdot { position: absolute; top: 7px; left: calc(50% + 9px); width: 6px; height: 6px; border-radius: 50%; display: none; }
+  .tabdot.warn { display: block; background: var(--ochre); }
+  .tabdot.fail { display: block; background: var(--accent); }
+
+  /* the view */
+  .status { left: 12px; top: 12px; }
+  .viewtools { right: 10px; top: 8px; }
+  .chip { height: 32px; padding: 0 12px; font-size: 12px; }
+  .dock { grid-template-columns: minmax(0, 1fr); gap: 2px; padding: 16px 14px 8px; }
+  body[data-sheet="design"] .dock, body[data-sheet="report"] .dock { display: none; }
+  .dock label, .steplabel { font-size: 9.5px; }
+  .toast { bottom: 96px; max-width: 94%; }
+  .tip { max-width: min(280px, 80vw); }
+
+  /* touch sizes, and 16 px text in fields (smaller makes iOS zoom the page on focus) */
+  .filter input, .val, select, .row.text input, #seed { font-size: 16px; }
+  .filter kbd { display: none; }
+  .row { padding: 8px 0 4px; }
+  .group-head { padding: 14px 0 8px; }
+  .lock { width: 36px; height: 34px; }
+  .lock svg { width: 14px; height: 14px; }
+  input[type="range"].slider { height: 30px; }
+  .slider::-webkit-slider-thumb { width: 22px; height: 22px; margin-top: -10.5px; }
+  .slider::-moz-range-thumb { width: 20px; height: 20px; }
+  .slider:hover::-webkit-slider-thumb { transform: none; }
+  .play { width: 32px; height: 32px; }
+
+  /* lightboxes: a full-width card */
+  .lb-card { width: 100vw; max-height: 92vh; max-height: 92dvh; }
+  .lb-head { padding: 10px 12px 8px 16px; }
+  .lb-body { padding: 14px 14px 16px; }
+  .photo img { max-height: 62vh; max-height: 62dvh; }
+  .files { columns: 1; }
+  .x { font-size: 22px; padding: 4px 8px; }
+}
+/* a phone held sideways: the sheet beside the view, a slimmer tab bar */
+@media (pointer: coarse) and (max-height: 520px) and (orientation: landscape) {
+  :root { --top: 44px; --tabs: 42px; --side: 0px; }
+  body {
+    grid-template-columns: minmax(0, 1fr) var(--side);
+    grid-template-rows: var(--top) minmax(0, 1fr) calc(var(--tabs) + env(safe-area-inset-bottom, 0px));
+    grid-template-areas: "top top" "stage sheet" "tabs tabs";
+  }
+  body[data-sheet="design"], body[data-sheet="report"] { --side: min(46vw, 400px); }
+  .panel { border-top: 0; border-left: 1px solid var(--hair); }
+  .tabbar button { flex-direction: row; gap: 7px; }
+  .tabbar svg { width: 18px; height: 18px; }
+  .tabdot { top: 9px; left: auto; right: calc(50% - 40px); }
+  .dock { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; padding: 10px 14px 6px; }
+  body[data-sheet="design"] .dock, body[data-sheet="report"] .dock { display: grid; }
+  .toast { bottom: 70px; }
+}
