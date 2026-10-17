@@ -1,7 +1,8 @@
 // Three.js stage: lighting, shadow-catching paper floor, GLB loading with
 // per-part materials, explode / assembly animation, picking and camera framing.
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { Fn, uniform, uniformArray, vec3, vec4, float, int, positionWorld, length, max, min, smoothstep, mix, abs, clamp, Loop, If, Break } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
@@ -205,15 +206,15 @@ export class Viewer {
   // woods like hinoki and maple); ?tm=agx or ?tm=aces switch for comparison.
   constructor(container, { background = '#EAE4D8', toneMapping = 'neutral', exposure = 1.0 } = {}) {
     this.container = container;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    // WebGPU where the browser has it, WebGL2 otherwise (three.js picks the backend)
+    this.renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
     const r = this.renderer;
     r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     r.outputColorSpace = THREE.SRGBColorSpace;
     r.toneMapping = { aces: THREE.ACESFilmicToneMapping, neutral: THREE.NeutralToneMapping, agx: THREE.AgXToneMapping }[toneMapping] ?? THREE.NeutralToneMapping;
     r.toneMappingExposure = exposure;
     r.shadowMap.enabled = true;
-    r.shadowMap.type = THREE.PCFShadowMap;
-    r.shadowMap.autoUpdate = false;          // shadows only change with the model or its pose
+    r.shadowMap.type = THREE.PCFSoftShadowMap;
     this._shadowDirty = true;
     container.appendChild(r.domElement);
     r.domElement.classList.add('gl');
@@ -221,13 +222,19 @@ export class Viewer {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(30, 1, 0.02, 200);
     this.camera.position.set(1.6, 1.1, 2.2);
-
-    // environment: soft studio room
-    const pmrem = new THREE.PMREMGenerator(r);
-    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     this.scene.environmentIntensity = 0.62;
     this.scene.environmentRotation.set(0, Math.PI * 0.32, 0);
-    pmrem.dispose();
+
+    // the renderer starts asynchronously (WebGPU adapter and device); then the
+    // environment: a soft studio room, prefiltered on the GPU
+    this.ready = r.init().then(async () => {
+      this.backend = r.backend?.isWebGPUBackend ? 'WebGPU' : 'WebGL2';
+      const pmrem = new THREE.PMREMGenerator(r);
+      const rt = pmrem.fromScene(new RoomEnvironment(), 0.04);
+      this.scene.environment = rt.texture;
+      this.requestRender();
+      return this.backend;
+    });
 
     // key light with soft shadows
     this.key = new THREE.DirectionalLight(0xfff6ec, 2.4);
@@ -239,59 +246,48 @@ export class Viewer {
     this.key.shadow.normalBias = 0.0032;
     this.scene.add(this.key, this.key.target);
 
-    // paper floor: opaque, unlit, darkened only by shadow and contact occlusion,
-    // so it melts into the background colour at the horizon
+    // paper floor: unlit, the background colour, darkened by contact occlusion
+    // round the feet and under the table (node material), with the key light's
+    // shadow laid over it by a shadow-only sheet
     this.setBackground(background);
     this.floorUniforms = {
-      uFloor: { value: new THREE.Color() },
-      uShadowTint: { value: new THREE.Color(0.40, 0.36, 0.33) },
-      uFeet: { value: Array.from({ length: MAX_FEET }, () => new THREE.Vector4(0, 0, 0, 0)) },
-      uFeetN: { value: 0 },
-      uBox: { value: new THREE.Vector4(0, 0, 0, 0) },
-      uBoxAO: { value: 0.0 },
+      uFloor: uniform(new THREE.Color()),
+      uShadowTint: uniform(new THREE.Color(0.40, 0.36, 0.33)),
+      uFeet: uniformArray(Array.from({ length: MAX_FEET }, () => new THREE.Vector4(0, 0, 0, 0)), 'vec4'),
+      uFeetN: uniform(0, 'int'),
+      uBox: uniform(new THREE.Vector4(0, 0, 0, 0)),
+      uBoxAO: uniform(0.0),
     };
     this._applyFloorColour();
-    const floorMat = new THREE.ShadowMaterial({ color: 0x000000, opacity: 0.42 });
-    floorMat.transparent = false;
-    floorMat.onBeforeCompile = (sh) => {
-      Object.assign(sh.uniforms, this.floorUniforms);
-      sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec2 vFloorXZ;')
-        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFloorXZ = (modelMatrix * vec4(position, 1.0)).xz;');
-      sh.fragmentShader = sh.fragmentShader
-        .replace('#include <common>', `#include <common>
-varying vec2 vFloorXZ;
-uniform vec3 uFloor;
-uniform vec3 uShadowTint;
-uniform vec4 uFeet[${MAX_FEET}];
-uniform int uFeetN;
-uniform vec4 uBox;
-uniform float uBoxAO;
-float floorOcclusion(vec2 p) {
-  float ao = 0.0;
-  for (int i = 0; i < ${MAX_FEET}; i++) {
-    if (i >= uFeetN) break;
-    vec4 f = uFeet[i];
-    float d = length(p - f.xy) / max(f.z, 1e-3);
-    ao += f.w * (1.0 - smoothstep(0.55, 1.9, d)) * (0.55 + 0.45 * (1.0 - smoothstep(0.0, 1.0, d)));
-  }
-  vec2 q = abs(p - uBox.xy) - uBox.zw;
-  float sd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
-  ao += uBoxAO * (1.0 - smoothstep(-0.25, 0.35, sd));
-  return clamp(ao, 0.0, 0.9);
-}`)
-        .replace('gl_FragColor = vec4( color, opacity * ( 1.0 - getShadowMask() ) );', `
-  float kgShadow = opacity * (1.0 - getShadowMask());
-  float kgAO = floorOcclusion(vFloorXZ);
-  float kgDark = 1.0 - (1.0 - kgShadow) * (1.0 - kgAO);
-  gl_FragColor = vec4(uFloor * mix(vec3(1.0), uShadowTint, kgDark), 1.0);`);
-    };
-    floorMat.customProgramCacheKey = () => 'kigumi-floor-1';
+    const fu = this.floorUniforms;
+    const floorAO = Fn(() => {
+      const p = positionWorld.xz;
+      const ao = float(0.0).toVar();
+      Loop(MAX_FEET, ({ i }) => {
+        If(int(i).greaterThanEqual(fu.uFeetN), () => { Break(); });
+        const f = fu.uFeet.element(i);
+        const d = length(p.sub(f.xy)).div(max(f.z, 1e-3));
+        ao.addAssign(f.w.mul(float(1.0).sub(smoothstep(0.55, 1.9, d))).mul(float(1.0).sub(smoothstep(0.0, 1.0, d)).mul(0.45).add(0.55)));
+      });
+      const q = abs(p.sub(fu.uBox.xy)).sub(fu.uBox.zw);
+      const sd = length(max(q, 0.0)).add(min(max(q.x, q.y), 0.0));
+      ao.addAssign(fu.uBoxAO.mul(float(1.0).sub(smoothstep(-0.25, 0.35, sd))));
+      return clamp(ao, 0.0, 0.9);
+    });
+    const floorMat = new THREE.MeshBasicNodeMaterial();
+    floorMat.colorNode = fu.uFloor.mul(mix(vec3(1.0), fu.uShadowTint, floorAO()));
+    floorMat.toneMapped = true;
     this.floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), floorMat);
     this.floor.rotation.x = -Math.PI / 2;
-    this.floor.receiveShadow = true;
-    this.floor.renderOrder = -1;
+    this.floor.renderOrder = -2;
     this.scene.add(this.floor);
+    const shadowMat = new THREE.ShadowNodeMaterial({ color: new THREE.Color(0.20, 0.17, 0.15), opacity: 0.42 });
+    this.shadowSheet = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), shadowMat);
+    this.shadowSheet.rotation.x = -Math.PI / 2;
+    this.shadowSheet.position.y = 0.0004;
+    this.shadowSheet.receiveShadow = true;
+    this.shadowSheet.renderOrder = -1;
+    this.scene.add(this.shadowSheet);
 
     // controls
     this.controls = new OrbitControls(this.camera, r.domElement);
@@ -388,7 +384,8 @@ float floorOcclusion(vec2 p) {
     if (this._pickPending) { this._pickPending = false; this._doPick(); }
     if (changed || this.needsRender) {
       this.needsRender = false;
-      if (this._shadowDirty) { this.renderer.shadowMap.needsUpdate = true; this._shadowDirty = false; }
+      if (!this.backend) return;               // the renderer is still starting
+      if (this._shadowDirty) { this.key.shadow.needsUpdate = true; this._shadowDirty = false; }
       this.renderer.render(this.scene, this.camera);
       this.onRendered?.();
     } else {
@@ -521,8 +518,8 @@ float floorOcclusion(vec2 p) {
     // compile off-screen before swapping so the old model stays until the new one is ready
     group.visible = true;
     try {
-      if (this.renderer.extensions.has('KHR_parallel_shader_compile')) await this.renderer.compileAsync(group, this.camera, this.scene);
-      else this.renderer.compile(group, this.camera, this.scene);
+      await this.ready;
+      await this.renderer.compileAsync(group, this.camera, this.scene);
     } catch (e) { /* compile lazily on first render */ }
 
     // swap
@@ -548,7 +545,7 @@ float floorOcclusion(vec2 p) {
     // floor occlusion
     const fu = this.floorUniforms;
     fu.uFeetN.value = Math.min(MAX_FEET, feet.length);
-    feet.slice(0, MAX_FEET).forEach((f, i) => fu.uFeet.value[i].copy(f));
+    feet.slice(0, MAX_FEET).forEach((f, i) => fu.uFeet.array[i].copy(f));
     const c = restBox.getCenter(new THREE.Vector3());
     const s = restBox.getSize(new THREE.Vector3());
     fu.uBox.value.set(c.x, c.z, Math.max(0.01, s.x * 0.5 - 0.06), Math.max(0.01, s.z * 0.5 - 0.06));
@@ -735,8 +732,9 @@ float floorOcclusion(vec2 p) {
     this.frame(false, poses[view] || poses.hero);
     r.setPixelRatio(keep.ratio * scale);
     this._resize();
-    this.renderer.shadowMap.needsUpdate = true;
-    this.renderer.render(this.scene, cam);
+    await this.ready;
+    this.key.shadow.needsUpdate = true;
+    await this.renderer.renderAsync(this.scene, cam);
     const blob = await new Promise((res) => r.domElement.toBlob(res, 'image/png'));
     r.setPixelRatio(keep.ratio);
     cam.position.copy(keep.pos);

@@ -1,9 +1,15 @@
 // Materials for kigumi parts: procedural wood grain (rings around the part's local
 // +X axis, which is the grain direction), charred cedar crackle, glass and the
 // small rubber / silicone bits.  One material per part so each board gets its own
-// pith offset and tint; all wood materials share a single compiled program.
+// pith offset and tint; the patterns are TSL node graphs (three.js shading
+// language), compiled to WGSL for WebGPU or GLSL for the WebGL2 fallback, and
+// every board of a species shares one pipeline (only its uniforms differ).
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  Fn, uniform, float, vec2, vec3, fract, floor, mix, smoothstep, length, dot, fwidth, dFdx, dFdy,
+  normalize, cross, sign, abs, clamp, sqrt, min, positionLocal, positionView, normalView,
+} from 'three/tsl';
 
 // Mean sRGB colours (approximate) and figure parameters per species.
 //   rings  : growth rings per metre (fine woods have more)
@@ -61,143 +67,112 @@ function rng(seed) {
 }
 
 // ---------------------------------------------------------------------------
-// shader code
+// patterns (TSL)
 // ---------------------------------------------------------------------------
-const WOOD_PARS = /* glsl */`
-varying vec3 vKgLocal;
-uniform vec3 uKgEarly;
-uniform vec3 uKgLate;
-uniform vec4 uKgGrain;   // rings/m, latewood contrast, fibre contrast, figure contrast
-uniform vec4 uKgSeed;    // pith offset y z (m), pith tilt, random 0..1
-uniform vec3 uKgTint;
-uniform float uKgChar;
-uniform float uKgLateRough;
+const kgHash = Fn(([p0]) => {
+  const p = fract(p0.mul(0.3183099).add(0.1)).mul(17.0);
+  return fract(p.x.mul(p.y).mul(p.z).mul(p.x.add(p.y).add(p.z)));
+});
 
-float kgHash(vec3 p) {
-  p = fract(p * 0.3183099 + 0.1);
-  p *= 17.0;
-  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
-}
-float kgNoise(vec3 x) {
-  vec3 i = floor(x);
-  vec3 f = fract(x);
-  f = f * f * (3.0 - 2.0 * f);
-  return mix(mix(mix(kgHash(i + vec3(0.0, 0.0, 0.0)), kgHash(i + vec3(1.0, 0.0, 0.0)), f.x),
-                 mix(kgHash(i + vec3(0.0, 1.0, 0.0)), kgHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
-             mix(mix(kgHash(i + vec3(0.0, 0.0, 1.0)), kgHash(i + vec3(1.0, 0.0, 1.0)), f.x),
-                 mix(kgHash(i + vec3(0.0, 1.0, 1.0)), kgHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
-}
-float kgFbm(vec3 p) {
-  return 0.5333 * kgNoise(p) + 0.2667 * kgNoise(p * 2.03 + 3.1)
-       + 0.1333 * kgNoise(p * 4.07 + 7.7) + 0.0667 * kgNoise(p * 8.11 + 1.3);
-}
-// 3D Voronoi: distance to the nearest cell border (two passes, so it has no
-// creases inside a cell), a per-cell random value and the distance to the seed
-vec3 kgVoronoi(vec3 x) {
-  vec3 n = floor(x);
-  vec3 f = fract(x);
-  vec3 mg = vec3(0.0);
-  vec3 mr = vec3(0.0);
-  float md = 8.0;
-  for (int k = -1; k <= 1; k++)
-  for (int j = -1; j <= 1; j++)
-  for (int i = -1; i <= 1; i++) {
-    vec3 g = vec3(float(i), float(j), float(k));
-    vec3 c = n + g;
-    vec3 r = g + vec3(kgHash(c), kgHash(c + 17.31), kgHash(c + 41.97)) - f;
-    float d = dot(r, r);
-    if (d < md) { md = d; mr = r; mg = g; }
-  }
-  float be = 8.0;
-  for (int k = -1; k <= 1; k++)
-  for (int j = -1; j <= 1; j++)
-  for (int i = -1; i <= 1; i++) {
-    vec3 g = mg + vec3(float(i), float(j), float(k));
-    vec3 c = n + g;
-    vec3 r = g + vec3(kgHash(c), kgHash(c + 17.31), kgHash(c + 41.97)) - f;
-    vec3 dr = r - mr;
-    if (dot(dr, dr) > 1e-5) be = min(be, dot(0.5 * (mr + r), normalize(dr)));
-  }
-  return vec3(be, kgHash(n + mg + 7.77), sqrt(md));
-}
+const kgNoise = Fn(([x]) => {
+  const i = floor(x);
+  const f0 = fract(x);
+  const f = f0.mul(f0).mul(f0.mul(-2.0).add(3.0));
+  const h = (a, b, c) => kgHash(i.add(vec3(a, b, c)));
+  return mix(
+    mix(mix(h(0, 0, 0), h(1, 0, 0), f.x), mix(h(0, 1, 0), h(1, 1, 0), f.x), f.y),
+    mix(mix(h(0, 0, 1), h(1, 0, 1), f.x), mix(h(0, 1, 1), h(1, 1, 1), f.x), f.y), f.z);
+});
 
-// p: local position in metres, +X along the grain.  Returns linear albedo and
-// writes a bump height (m) and a roughness offset.
-vec3 kgWood(vec3 p, out float h, out float dr) {
-  h = 0.0;
-  dr = 0.0;
-  if (uKgChar > 0.5) {
+const kgFbm = Fn(([p]) => kgNoise(p).mul(0.5333)
+  .add(kgNoise(p.mul(2.03).add(3.1)).mul(0.2667))
+  .add(kgNoise(p.mul(4.07).add(7.7)).mul(0.1333))
+  .add(kgNoise(p.mul(8.11).add(1.3)).mul(0.0667)));
+
+// cellular pattern for charred cedar: F2 - F1 (distance to the nearest crack)
+// and a per-cell random value, unrolled over the 27 neighbour cells
+const kgCells = Fn(([x]) => {
+  const n = floor(x);
+  const f = fract(x);
+  const d1 = float(8.0).toVar();
+  const d2 = float(8.0).toVar();
+  const cv = float(0.0).toVar();
+  for (let k = -1; k <= 1; k++) {
+    for (let j = -1; j <= 1; j++) {
+      for (let i = -1; i <= 1; i++) {
+        const g = vec3(i, j, k);
+        const c = n.add(g);
+        const r = g.add(vec3(kgHash(c), kgHash(c.add(17.31)), kgHash(c.add(41.97)))).sub(f);
+        const d = dot(r, r);
+        const closer = d.lessThan(d1);
+        d2.assign(closer.select(d1, min(d2, d)));
+        cv.assign(closer.select(kgHash(c.add(7.77)), cv));
+        d1.assign(min(d1, d));
+      }
+    }
+  }
+  return vec3(sqrt(d2).sub(sqrt(d1)), cv, sqrt(d1));
+});
+
+// Node graphs for one board: albedo (linear), bump height (m), roughness offset.
+// p is the local position in metres, +X along the grain.
+function woodNodes(u, char) {
+  const p = positionLocal;
+  if (char) {
     // yakisugi: charred "alligator" scales, elongated along the grain, dark cracks
-    vec3 c = p * vec3(52.0, 118.0, 118.0) + uKgSeed.xyz * 40.0;     // scales ~19 x 8 mm
-    vec3 v = kgVoronoi(c);
-    float e = v.x;                                                   // distance to a crack
-    float detail = 1.0 - smoothstep(0.35, 1.1, fwidth(c.x) + fwidth(c.y) + fwidth(c.z));
-    float crack = (1.0 - smoothstep(0.018, 0.05 + fwidth(e), e)) * detail;
-    float soot = kgFbm(p * vec3(9.0, 34.0, 34.0) + uKgSeed.w * 9.0);
-    float scale = mix(1.0, 0.8 + 0.55 * v.y, detail);
-    vec3 col = uKgEarly * scale * (0.8 + 0.4 * soot);
-    col = mix(col, uKgEarly * 0.1, crack);
-    dr = mix(-0.12 * detail, 0.16, crack);
-    h = detail * smoothstep(0.0, 0.14, e) * 0.00016;                 // scale edges round into the cracks
-    return col * uKgTint;
+    const c = p.mul(vec3(52.0, 118.0, 118.0)).add(u.seed.xyz.mul(40.0));
+    const v = kgCells(c);
+    const e = v.x.mul(0.5);
+    const detail = float(1.0).sub(smoothstep(0.35, 1.1, fwidth(c.x).add(fwidth(c.y)).add(fwidth(c.z))));
+    const crack = float(1.0).sub(smoothstep(0.018, fwidth(e).add(0.05), e)).mul(detail);
+    const soot = kgFbm(p.mul(vec3(9.0, 34.0, 34.0)).add(u.seed.w.mul(9.0)));
+    const scale = mix(float(1.0), v.y.mul(0.55).add(0.8), detail);
+    const col = mix(u.early.mul(scale).mul(soot.mul(0.4).add(0.8)), u.early.mul(0.1), crack).mul(u.tint);
+    const dr = mix(detail.mul(-0.12), float(0.16), crack);
+    const h = detail.mul(smoothstep(0.0, 0.14, e)).mul(0.00016);
+    return { col, h, dr };
   }
-  // pith runs roughly along +X, offset outside the board and slightly tilted
-  vec2 yz = p.yz + uKgSeed.xy + p.x * vec2(uKgSeed.z, -0.55 * uKgSeed.z);
-  float wob = kgFbm(vec3(p.x * 3.0, p.y * 15.0, p.z * 15.0) + uKgSeed.w * 37.0) - 0.5;
-  float r = length(yz) + wob * 0.010;
-  float rings = r * uKgGrain.x;
+  // the pith runs roughly along +X, outside the board and slightly tilted
+  const yz = p.yz.add(u.seed.xy).add(vec2(u.seed.z, u.seed.z.mul(-0.55)).mul(p.x));
+  const wob = kgFbm(vec3(p.x.mul(3.0), p.y.mul(15.0), p.z.mul(15.0)).add(u.seed.w.mul(37.0))).sub(0.5);
+  const r = length(yz).add(wob.mul(0.010));
+  const rings0 = r.mul(u.grain.x);
   // uneven growth: ring widths wander over a few rings
-  rings += 1.7 * (kgNoise(vec3(rings * 0.13, uKgSeed.w * 7.0, 0.5)) - 0.5);
-  float fw = fwidth(rings);
-  float aa = 1.0 - smoothstep(0.12, 0.5, fw);
-  float f = fract(rings);
-  float edge = max(0.025, fw);
-  float lw = smoothstep(0.50, 0.90, f) * (1.0 - smoothstep(1.0 - edge, 1.0, f));
-  float rv = kgHash(vec3(floor(rings), uKgSeed.w * 13.0, 1.7));
-  lw *= 0.6 + 0.8 * rv;
-  lw = mix(0.27, lw, aa);
-  float fig = kgNoise(vec3(rings * 0.21, p.x * 0.9, uKgSeed.w * 9.0)) - 0.5;
-  fig *= 1.0 - smoothstep(2.0, 6.0, fw);
-  vec3 fq = vec3(p.x * 7.0, p.y * 1100.0, p.z * 1100.0);
-  float fib = 0.62 * kgNoise(fq) + 0.38 * kgNoise(fq * vec3(1.7, 2.3, 2.3) + 5.1) - 0.5;
-  float fwF = fwidth(fq.y) + fwidth(fq.z);
-  fib *= 1.0 - smoothstep(0.35, 1.3, fwF);
-  vec3 col = mix(uKgEarly, uKgLate, clamp(lw * uKgGrain.y, 0.0, 1.0));
-  col *= 1.0 + 2.0 * uKgGrain.w * fig;
-  col *= 1.0 + 2.0 * uKgGrain.z * fib;
-  dr = (lw - 0.27) * uKgLateRough;
-  h = (lw * 0.000012 + fib * 0.000006) * aa;
-  return col * uKgTint;
+  const rings = rings0.add(kgNoise(vec3(rings0.mul(0.13), u.seed.w.mul(7.0), 0.5)).sub(0.5).mul(1.7));
+  const fw = fwidth(rings);
+  const aa = float(1.0).sub(smoothstep(0.12, 0.5, fw));
+  const f = fract(rings);
+  const edge = fw.max(0.025);
+  const lw0 = smoothstep(0.50, 0.90, f).mul(float(1.0).sub(smoothstep(float(1.0).sub(edge), 1.0, f)));
+  const rv = kgHash(vec3(floor(rings), u.seed.w.mul(13.0), 1.7));
+  const lw = mix(float(0.27), lw0.mul(rv.mul(0.8).add(0.6)), aa);
+  const fig = kgNoise(vec3(rings.mul(0.21), p.x.mul(0.9), u.seed.w.mul(9.0))).sub(0.5)
+    .mul(float(1.0).sub(smoothstep(2.0, 6.0, fw)));
+  const fq = vec3(p.x.mul(7.0), p.y.mul(1100.0), p.z.mul(1100.0));
+  const fwF = fwidth(fq.y).add(fwidth(fq.z));
+  const fib = kgNoise(fq).mul(0.62).add(kgNoise(fq.mul(vec3(1.7, 2.3, 2.3)).add(5.1)).mul(0.38)).sub(0.5)
+    .mul(float(1.0).sub(smoothstep(0.35, 1.3, fwF)));
+  const col = mix(u.early, u.late, clamp(lw.mul(u.grain.y), 0.0, 1.0))
+    .mul(u.grain.w.mul(2.0).mul(fig).add(1.0))
+    .mul(u.grain.z.mul(2.0).mul(fib).add(1.0))
+    .mul(u.tint);
+  const dr = lw.sub(0.27).mul(u.lateRough);
+  const h = lw.mul(0.000012).add(fib.mul(0.000006)).mul(aa);
+  return { col, h, dr };
 }
 
-// bump from a procedural height (Mikkelsen surface gradient, unnormalised so the
-// height is in physical units)
-vec3 kgBump(vec3 surfPos, vec3 n, float hgt, float faceDir) {
-  vec3 sx = dFdx(surfPos);
-  vec3 sy = dFdy(surfPos);
-  vec3 r1 = cross(sy, n);
-  vec3 r2 = cross(n, sx);
-  float det = dot(sx, r1) * faceDir;
-  vec2 dh = vec2(dFdx(hgt), dFdy(hgt));
-  vec3 g = sign(det) * (dh.x * r1 + dh.y * r2);
-  return normalize(abs(det) * n - g);
-}
-`;
-
-function patchWood(shader, uniforms) {
-  Object.assign(shader.uniforms, uniforms);
-  shader.vertexShader = shader.vertexShader
-    .replace('#include <common>', '#include <common>\nvarying vec3 vKgLocal;')
-    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvKgLocal = position;');
-  shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>', '#include <common>\n' + WOOD_PARS)
-    .replace('#include <color_fragment>',
-      '#include <color_fragment>\nfloat kgH; float kgDR;\ndiffuseColor.rgb = kgWood(vKgLocal, kgH, kgDR);')
-    .replace('#include <roughnessmap_fragment>',
-      '#include <roughnessmap_fragment>\nroughnessFactor = clamp(roughnessFactor + kgDR, 0.05, 1.0);')
-    .replace('#include <normal_fragment_maps>',
-      '#include <normal_fragment_maps>\nnormal = kgBump(-vViewPosition, normal, kgH, faceDirection);');
-}
+// bump from a procedural height (surface gradient, in physical units)
+const kgBump = Fn(([hgt]) => {
+  const pos = positionView;
+  const n = normalView;
+  const sx = dFdx(pos);
+  const sy = dFdy(pos);
+  const r1 = cross(sy, n);
+  const r2 = cross(n, sx);
+  const det = dot(sx, r1);
+  const g = sign(det).mul(r1.mul(dFdx(hgt)).add(r2.mul(dFdy(hgt))));
+  return normalize(abs(det).mul(n).sub(g));
+});
 
 const _c = new THREE.Color();
 
@@ -224,16 +199,15 @@ export function makeWoodMaterial(species, partId, fallbackHex) {
   const dist = 0.18 + 0.35 * rand();                  // pith 18..53 cm away
   const seed = new THREE.Vector4(Math.cos(ang) * dist, Math.sin(ang) * dist,
     (rand() - 0.5) * 0.08, rand());
-  const uniforms = {
-    uKgEarly: { value: early },
-    uKgLate: { value: late },
-    uKgGrain: { value: new THREE.Vector4(sp.rings || 0, sp.late || 0, sp.fibre || 0, sp.figure || 0) },
-    uKgSeed: { value: seed },
-    uKgTint: { value: tint },
-    uKgChar: { value: sp.char ? 1 : 0 },
-    uKgLateRough: { value: sp.char ? 0 : 0.10 },
+  const u = {
+    early: uniform(early),
+    late: uniform(late),
+    grain: uniform(new THREE.Vector4(sp.rings || 0, sp.late || 0, sp.fibre || 0, sp.figure || 0)),
+    seed: uniform(seed),
+    tint: uniform(tint),
+    lateRough: uniform(sp.char ? 0 : 0.10),
   };
-  const mat = new THREE.MeshPhysicalMaterial({
+  const mat = new THREE.MeshPhysicalNodeMaterial({
     color: 0xffffff,
     roughness: sp.rough,
     metalness: 0,
@@ -242,15 +216,18 @@ export function makeWoodMaterial(species, partId, fallbackHex) {
     specularIntensity: sp.char ? 0.45 : 0.5,
   });
   mat.name = 'wood:' + species;
-  mat.onBeforeCompile = (shader) => patchWood(shader, uniforms);
-  mat.customProgramCacheKey = () => 'kigumi-wood-1';
+  const w = woodNodes(u, !!sp.char);
+  mat.colorNode = w.col;
+  mat.roughnessNode = clamp(float(sp.rough).add(w.dr), 0.05, 1.0);
+  mat.normalNode = kgBump(w.h);
+  const uniforms = u;
   mat.userData.kigumi = { species, uniforms };
   return mat;
 }
 
 export function makeGlassMaterial(kind, thicknessM) {
   const acrylic = kind === 'acrylic';
-  const mat = new THREE.MeshPhysicalMaterial({
+  const mat = new THREE.MeshPhysicalNodeMaterial({
     color: acrylic ? 0xffffff : 0xf3faf8,
     metalness: 0,
     roughness: 0,
@@ -268,7 +245,7 @@ export function makeGlassMaterial(kind, thicknessM) {
 
 // Float glass edges look green: a long path through slightly iron-rich glass.
 export function makeGlassEdgeMaterial(thicknessM) {
-  const mat = new THREE.MeshPhysicalMaterial({
+  const mat = new THREE.MeshPhysicalNodeMaterial({
     color: 0xe8f4ef,
     metalness: 0,
     roughness: 0.2,
@@ -291,15 +268,15 @@ export function makePartMaterial({ id, kind, material, fallbackHex, glassThickne
     return makeGlassMaterial(material === 'acrylic' ? 'acrylic' : 'glass', glassThickness);
   }
   if (material === 'rubber') {
-    return new THREE.MeshPhysicalMaterial({ color: OTHER.rubber.hex, roughness: 0.78, metalness: 0, specularIntensity: 0.5 });
+    return new THREE.MeshPhysicalNodeMaterial({ color: OTHER.rubber.hex, roughness: 0.78, metalness: 0, specularIntensity: 0.5 });
   }
   if (material === 'silicone') {
     // thin frosted bumper: mostly the wood below, a little milky
     const c = new THREE.Color(underHex || OTHER.silicone.hex).lerp(new THREE.Color(OTHER.silicone.hex), 0.45);
-    return new THREE.MeshPhysicalMaterial({ color: c, roughness: 0.3, metalness: 0, specularIntensity: 0.8 });
+    return new THREE.MeshPhysicalNodeMaterial({ color: c, roughness: 0.3, metalness: 0, specularIntensity: 0.8 });
   }
   if (SPECIES[material] || WOOD_KINDS.has(kind)) {
     return makeWoodMaterial(material, id, fallbackHex);
   }
-  return new THREE.MeshPhysicalMaterial({ color: fallbackHex || '#9a9083', roughness: 0.6, metalness: 0 });
+  return new THREE.MeshPhysicalNodeMaterial({ color: fallbackHex || '#9a9083', roughness: 0.6, metalness: 0 });
 }

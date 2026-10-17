@@ -34,6 +34,7 @@ await page.evaluate(() => window.kigumi.settled());
 clearInterval(poll);
 const status = await page.evaluate(() => window.kigumi.engine.status);
 log('engine status', JSON.stringify(status));
+log('viewer backend', await page.evaluate(() => window.kigumi.viewer.backend));
 const rep = await page.evaluate(() => window.kigumi.report);
 log('report keys', Object.keys(rep || {}).slice(0, 12).join(','), 'checks', (rep && rep.checks || []).length);
 await page.screenshot({ path: path.join(OUT, '01-first-design.png') });
