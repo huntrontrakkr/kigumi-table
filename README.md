@@ -49,10 +49,14 @@ renderer and the photo path tracer on your GPU (WebGPU).
   you add `?gpu-solver` to the address. `tools/gpu-test/NOTES.md` has the numbers.
 * **Rendering.** three.js `WebGPURenderer`, with the procedural wood written in TSL (compiled to
   WGSL, or GLSL on the WebGL2 fallback). **Render photo** path-traces the scene on the GPU
-  (`site/render/`) instead of Blender.
+  (`site/render/`): a WGSL megakernel, a binned-SAH BVH built in a worker, and the wood ported to
+  WGSL. 1600 x 1100 at 256 samples takes about 4.5 s on an RTX 3090. Slower GPUs stop at a 15 s
+  budget, phones render 1200 x 825, and without WebGPU the photo is a rasterised still.
 * **Export.** The fabrication package comes as a zip: CNC strip sheets (DXF), glass DXF,
   drawings, cut list, `FABRICATION.md`, GLB and STL. STEP and Rhino `.3dm` come from the Python
   package on your own machine.
+
+![Render photo, path-traced in the browser](docs/images/browser-photo.jpg)
 
 Tested in Chrome on Windows (WebGPU on an RTX 3090) and, headless, in Firefox, in WebKit
 (Safari's engine) emulating an iPhone, and in Chromium emulating Android phones. Browsers without
@@ -67,9 +71,14 @@ A design change takes a few seconds on a desktop; phones take longer.
 
 Develop locally: `uv run python scripts/build_site.py` (packs the Python sources into
 `site/py/kigumi.zip`), then serve `site/` with any static server, e.g. `python3 -m http.server -d site`.
-`tools/web-engine-test/run.mjs` runs the same engine under Node, `tools/gpu-test/` tests the GPU
-solver, and `tools/ui-test/mobile-smoke.mjs` drives the page as an iPhone (WebKit) or an Android
-phone (Chromium) by touch.
+Other tools:
+
+* `tools/web-engine-test/run.mjs` runs the same engine under Node.
+* `tools/gpu-test/` tests the GPU solver, and `tools/pathtracer-test/` tests the path tracer.
+* `tools/ui-test/mobile-smoke.mjs` drives the page as an iPhone (WebKit) or an Android phone
+  (Chromium) by touch.
+* `tools/win-chrome/` starts a headless Chrome on the Windows host of a WSL2 box with its own
+  profile, and drives it over DevTools, for tests on the real GPU.
 
 ## Run locally (Python)
 
