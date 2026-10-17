@@ -451,7 +451,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   const n = prep.n;
   const lay = layoutFor(m);
   const kp = lay.kp;
-  const st = await getState(gpu, prep, lay);
+  let st = null;                                // GPU buffers, made when first needed
   const { s, indptr, indices, data } = prep;
   const b = colToRow(n, m, rhs, j0);
   const x = x0 ? colToRow(n, m, x0, j0) : new Float64Array(n * m);
@@ -500,6 +500,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     }
     cpuMs += now() - tc;
     const tg = now();
+    if (!st) st = await getState(gpu, prep, lay);
     const inner = await innerSolve(gpu, st, rs, opt);
     gpuMs += now() - tg;
     iters += inner.its;

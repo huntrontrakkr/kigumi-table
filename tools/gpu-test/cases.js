@@ -99,6 +99,24 @@ function plan(params, manifest) {
     items.push({ id: 'plate_big', group: 'model', accept: ACCEPT,
       make: async () => { const c = await exported('plate_big'); return bigk && bigk < c.k ? columns(c, 0, bigk) : c; } });
   }
+  // robustness: chunked batches, zero and exact columns, Jacobi, 64-bit indices, bad input
+  items.push({ id: 'chunks', group: 'robust', accept: ACCEPT, opts: { maxCols: 16 },
+    note: 'k = 40 split into 3 GPU batches (maxCols 16)', make: async () => ({ ...laplace2d(24, 24, 40), name: 'laplace2d k=40 in 3 batches' }) });
+  items.push({ id: 'zero_rhs', group: 'robust', accept: ACCEPT, note: 'a zero right-hand side column (x = 0 exactly)',
+    make: async () => { const c = laplace2d(24, 24, 3); c.rhs.fill(0, c.n, 2 * c.n); c.xref.fill(0, c.n, 2 * c.n); return { ...c, name: 'laplace2d, zero column' }; } });
+  items.push({ id: 'x0_exact', group: 'robust', accept: ACCEPT, note: 'x0 = the exact solution: no GPU work',
+    x0: (c) => Float64Array.from(c.xref), expect: (r) => r.iters === 0 && r.refinements === 0,
+    make: async () => ({ ...laplace2d(24, 24, 2), name: 'laplace2d, exact x0' }) });
+  items.push({ id: 'jacobi', group: 'robust', accept: ACCEPT, precond: 'jacobi', make: async () => laplace2d(30, 30, 4) });
+  items.push({ id: 'int64_indices', group: 'robust', accept: ACCEPT, note: 'BigInt64Array indptr/indices (int64 from Python)',
+    make: async () => { const c = laplace2d(24, 24, 2);
+      return { ...c, name: 'laplace2d, int64 indices', indptr: BigInt64Array.from(c.indptr, BigInt), indices: BigInt64Array.from(c.indices, BigInt) }; } });
+  items.push({ id: 'not_spd', group: 'robust', expectError: /not SPD/, note: 'negative diagonal entry: must throw',
+    make: async () => { const c = laplace2d(10, 10, 1); const d = Float64Array.from(c.data);
+      for (let p = c.indptr[5]; p < c.indptr[6]; p++) if (c.indices[p] === 5) d[p] = -1;
+      return { ...c, data: d, name: 'negative diagonal' }; } });
+  items.push({ id: 'bad_csr', group: 'robust', expectError: /indptr/, note: 'indptr of the wrong length: must throw',
+    make: async () => { const c = laplace2d(10, 10, 1); return { ...c, indptr: c.indptr.subarray(0, c.n), name: 'malformed CSR' }; } });
   if (params.compare) {
     for (const name of ['plate_four', 'grillage_four']) {
       if (!meta[name]) continue;
@@ -128,16 +146,27 @@ export async function runAll(params, onCase = () => {}, onLog = () => {}) {
   const results = [];
   for (const item of plan(params, manifest)) {
     let res;
+    let c = null;
     try {
-      const c = await item.make();
-      onLog(`${item.id}: n=${c.n} nnz=${c.indptr[c.n]} k=${c.k} ...`);
+      c = await item.make();
+      onLog(`${item.id}: n=${c.n} nnz=${Number(c.indptr[c.indptr.length - 1])} k=${c.k} ...`);
       const r = await sparse.solveSPD(gpu, {
         n: c.n, k: c.k, indptr: c.indptr, indices: c.indices, data: c.data, rhs: c.rhs,
-        x0: item.x0 ? item.x0(c) : undefined, ...opts, ...(item.precond ? { precond: item.precond } : {}),
+        x0: item.x0 ? item.x0(c) : undefined, ...opts, ...(item.opts || {}), ...(item.precond ? { precond: item.precond } : {}),
       });
-      res = score(item, c, r);
+      if (item.expectError) {
+        res = { id: item.id, name: c.name, error: 'expected an error, got a result', pass: false };
+      } else {
+        res = score(item, { ...c, indptr: Int32Array.from(c.indptr, Number) }, r);
+        if (item.expect && !item.expect(r)) { res.pass = false; res.note = 'unexpected: ' + (item.note || ''); }
+      }
     } catch (e) {
-      res = { id: item.id, name: item.id, error: String((e && e.stack) || e), pass: item.accept ? false : null };
+      const msg = String((e && e.message) || e);
+      if (item.expectError && item.expectError.test(msg)) {
+        res = { id: item.id, name: (c && c.name) || item.id, expectedError: msg, pass: true, note: item.note };
+      } else {
+        res = { id: item.id, name: item.id, error: String((e && e.stack) || e), pass: item.accept || item.expectError ? false : null };
+      }
     }
     results.push(res);
     onCase(res);

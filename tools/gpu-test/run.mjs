@@ -4,7 +4,8 @@
 // waits for window.__results, prints a summary and writes out/results.json.
 //
 //   node tools/gpu-test/run.mjs [--cases id,group,...] [--compare] [--mode worker|main]
-//                               [--bigk 16] [--eta 1e-4] [--precond fsai] [--timeout 3600] [--headed]
+//                               [--bigk 16] [--eta 1e-4] [--precond fsai] [--timeout 3600]
+//                               [--out results.json] [--headed]
 //
 // Exit code 0 when every case with acceptance criteria passes.
 // Reuses Playwright from tools/ui-test/node_modules.  On this machine Chromium needs
@@ -33,8 +34,10 @@ for (let i = 0; i < argv.length; i++) {
 }
 const headed = !!flags.headed;
 const timeoutMs = (+flags.timeout || 3600) * 1000;
+const outFile = path.resolve(HERE, 'out', flags.out || 'results.json');
 delete flags.headed;
 delete flags.timeout;
+delete flags.out;
 
 let chromium;
 try {
@@ -97,12 +100,13 @@ try {
   await page.waitForFunction(() => window.__results, null, { timeout: timeoutMs, polling: 1000 });
   const out = await page.evaluate(() => window.__results);
 
-  fs.mkdirSync(path.join(HERE, 'out'), { recursive: true });
-  fs.writeFileSync(path.join(HERE, 'out/results.json'), JSON.stringify(out, null, 1));
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   const e = (v) => (v == null ? '' : Number(v).toExponential(1));
   const rows = [['case', 'n', 'k', 'precond', 'iters', 'refs', 'relres', 'error', 'floor', 'setup ms', 'total ms', 'result']];
   for (const r of out.results) {
-    rows.push(r.error ? [r.id, '', '', '', '', '', '', '', '', '', '', 'ERROR']
+    rows.push(r.expectedError ? [r.name, '', '', '', '', '', '', '', '', '', '', 'pass (threw)']
+      : r.error ? [r.id, '', '', '', '', '', '', '', '', '', '', 'ERROR']
       : [r.name, r.n, r.k, r.precond, r.iters, r.refinements, e(r.relresMax), e(r.errMax), e(r.floorMax),
         Math.round(r.setupMs || 0), Math.round(r.ms), r.pass === true ? 'pass' : r.pass === false ? 'FAIL' : 'info']);
   }
@@ -111,7 +115,7 @@ try {
   for (const r of rows) console.log(r.map((v, c) => (c === 0 ? String(v).padEnd(w[c]) : String(v).padStart(w[c]))).join('  '));
   for (const r of out.results) if (r.error) console.log(`\n${r.id}: ${r.error}`);
   console.log(`\nadapter: ${out.gpu ? JSON.stringify(out.gpu) : 'none'}${out.error ? '\nerror: ' + out.error : ''}`);
-  console.log(`${out.ok ? 'PASS' : 'FAIL'} (${out.mode} mode, ${(out.wallMs / 1000).toFixed(1)} s); details in tools/gpu-test/out/results.json`);
+  console.log(`${out.ok ? 'PASS' : 'FAIL'} (${out.mode} mode, ${(out.wallMs / 1000).toFixed(1)} s); details in ${path.relative(ROOT, outFile)}`);
   exitCode = out.ok ? 0 : 1;
 } catch (err) {
   console.error(err);

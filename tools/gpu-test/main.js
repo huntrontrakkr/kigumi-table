@@ -20,7 +20,11 @@ function show(r) {
   const tr = document.createElement('tr');
   const cell = (v, cls) => { const td = document.createElement('td'); td.textContent = v; if (cls) td.className = cls; tr.appendChild(td); };
   cell(r.name || r.id);
-  if (r.error) {
+  if (r.expectedError) {
+    for (let i = 0; i < 11; i++) cell('');
+    cell('pass (threw)', 'pass');
+    log(`${r.id}: threw as expected: ${r.expectedError}`);
+  } else if (r.error) {
     cell(''); cell(''); cell(''); cell(''); cell(''); cell(''); cell(''); cell(''); cell(''); cell(''); cell('');
     cell('error', 'fail');
     log(`${r.id}: ${r.error}`);
