@@ -101,6 +101,20 @@ if (tab) {
 } else {
   log('no mobile tabs on this page');
 }
+// a photo from the Photo tab (path-traced with WebGPU, else a rasterised still)
+if (arg('photo', '')) {
+  const tp = Date.now();
+  await page.tap('#tab-photo');
+  await page.waitForFunction(() => document.querySelector('#lightbox .photo img') || document.querySelector('#lightbox .lb-msg'),
+    null, { timeout: 300_000 });
+  const img = await page.$eval('#lightbox .photo img', (i) => [i.naturalWidth, i.naturalHeight]).catch(() => null);
+  log(img ? `photo in ${((Date.now() - tp) / 1000).toFixed(1)} s: ${img.join(' x ')}` : 'PHOTO FAILED');
+  await page.waitForTimeout(800);                 // the lightbox fades in
+  await shot('05-photo');
+  await page.tap('#lb-close');
+  await page.waitForTimeout(1500);
+  await shot('05b-after-photo');                  // the view is back as it was
+}
 // the fabrication package from the Export tab (a zip made in the page)
 if (arg('export', '')) {
   const te = Date.now();
@@ -110,7 +124,7 @@ if (arg('export', '')) {
   const files = await page.$$eval('#lightbox .files a', (as) => as.map((a) => a.textContent));
   if (!files.length) log('EXPORT FAILED:', await page.$eval('#lightbox .lb-msg', (m) => m.textContent.replace(/\s+/g, ' ').slice(0, 400)));
   else log('export in', ((Date.now() - te) / 1000).toFixed(1), 's:', files.join(', '));
-  await shot('05-export');
+  await shot('06-export');
   await page.tap('#lb-close');
 }
 // orbit with a one-finger drag on the canvas (touch events)

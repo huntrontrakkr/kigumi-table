@@ -90,10 +90,43 @@ async function serverApi(path, body) {
   return data;
 }
 
-// Photo: a high-resolution render of the live scene on the GPU (see viewer.photo)
+// Photo in the page: path-traced on the GPU (render/pathtracer.js: WebGPU, a
+// 15 s budget, a converging preview), else a rasterised still (viewer.photo)
 async function renderLocally(body) {
-  const blob = await viewer.photo({ view: (body && body.view) || 'hero' });
+  const view = (body && body.view) || 'hero';
+  let blob = null;
+  if (navigator.gpu) {
+    try {
+      const pt = await import('./render/pathtracer.js');
+      blob = await pt.renderPhoto({
+        viewer, view, budgetMs: 15000,
+        onProgress: (frac, spp) => showPhotoProgress(frac, spp),
+        onPreview: (bitmap) => showPhotoPreview(bitmap),
+      });
+      if (!blob) console.info('path tracer unavailable:', pt.lastStats?.reason);
+    } catch (e) {
+      console.warn('path tracer failed; rasterising instead', e);
+    }
+  }
+  if (!blob) blob = await viewer.photo({ view });
   return { png: URL.createObjectURL(blob) };
+}
+function showPhotoProgress(frac, spp) {
+  const el = $('#pt-progress');
+  if (el) el.textContent = `${spp} samples · ${Math.round(100 * frac)}%`;
+}
+function showPhotoPreview(bitmap) {
+  const cv = $('#pt-preview');
+  if (!cv) return;
+  cv.width = bitmap.width;
+  cv.height = bitmap.height;
+  cv.getContext('2d').drawImage(bitmap, 0, 0);
+  cv.hidden = false;
+}
+// warm the path tracer (device, shaders) when a photo looks likely
+function warmPathTracer() {
+  if (backend.server || !navigator.gpu || !viewer) return;
+  import('./render/pathtracer.js').then((pt) => pt.preparePathTracer?.(viewer)).catch(() => {});
 }
 
 // ---------------------------------------------------------------- param helpers
@@ -798,7 +831,8 @@ function showTip(id, ptr) {
 }
 
 // ---------------------------------------------------------------- render photo / export
-const VIEWS = ['hero', 'top', 'low', 'detail', 'side'];
+const views = () => (backend.server ? ['hero', 'top', 'low', 'detail', 'side'] : ['current', 'hero', 'top', 'low', 'side']);
+const viewName = (v) => (v === 'current' ? 'this view' : v);
 const photo = { busy: false, view: 'hero', url: null, error: null, trace: null, t0: 0, key: '' };
 let lightboxMode = '';
 let photoTimer = null;
@@ -844,25 +878,27 @@ async function renderPhoto(view = 'hero') {
   }
 }
 function showPhotoBox() {
-  const chips = `<div class="views" role="group" aria-label="Camera">${VIEWS.map((v) =>
-    `<button type="button" class="chip" data-view="${v}" aria-pressed="${v === photo.view}" ${photo.busy ? 'disabled' : ''}>${v}</button>`).join('')}</div>`;
+  const chips = `<div class="views" role="group" aria-label="Camera">${views().map((v) =>
+    `<button type="button" class="chip" data-view="${v}" aria-pressed="${v === photo.view}" ${photo.busy ? 'disabled' : ''}>${esc(viewName(v))}</button>`).join('')}</div>`;
   let content;
   if (photo.busy) {
-    content = `<div class="lb-wait"><div class="spinner" aria-hidden="true"></div>
+    content = `<div class="lb-wait">
+      <canvas id="pt-preview" class="pt-preview" hidden></canvas><div class="spinner" aria-hidden="true"></div>
       <p>${backend.server ? 'Rendering with Blender Cycles <span class="faint">· usually 10–30 s ·</span>'
-        : 'Rendering on your GPU <span class="faint">· a few seconds ·</span>'} <span id="lb-elapsed" class="faint">${Math.round((performance.now() - photo.t0) / 1000)} s</span></p></div>
+        : 'Path tracing on your GPU <span class="faint">· up to 15 s ·</span> <span id="pt-progress" class="faint"></span>'}
+        <span id="lb-elapsed" class="faint">${Math.round((performance.now() - photo.t0) / 1000)} s</span></p></div>
       <div class="lb-foot">${chips}</div>`;
   } else if (photo.url) {
     const stale = photo.key !== paramsKey();
     content = `<figure class="photo"><img src="${esc(photo.url)}" alt="Rendered ${esc(photo.view)} view"></figure>
       <div class="lb-foot">${chips}<span class="links">${stale ? '<span class="faint">design changed since — pick a view to re-render</span>' : ''}
-      <a href="${esc(photo.url)}" target="_blank" rel="noopener">Open full size</a><a href="${esc(photo.url)}" download>Download</a></span></div>`;
+      <a href="${esc(photo.url)}" target="_blank" rel="noopener">Open full size</a><a href="${esc(photo.url)}" download="kigumi-${esc(photo.view)}.png">Download</a></span></div>`;
   } else {
     content = `<div class="lb-msg"><p>The photo couldn't be rendered.</p><p class="faint">${esc(photo.error || 'unknown error')}</p>
       ${photo.trace ? `<details><summary>details</summary><pre>${esc(photo.trace)}</pre></details>` : ''}</div>
       <div class="lb-foot">${chips}</div>`;
   }
-  const body = openLightbox(`Photo · ${photo.view}`, content, 'photo');
+  const body = openLightbox(`Photo · ${viewName(photo.view)}`, content, 'photo');
   $$('.views .chip', body).forEach((b) => b.addEventListener('click', () => renderPhoto(b.dataset.view)));
 }
 function onRenderButton() {
@@ -962,6 +998,7 @@ function wire() {
   $('#btn-frame').addEventListener('click', () => viewer.frame(true));
   $$('#tabbar [data-tab]').forEach((b) => b.addEventListener('click', () => setSheet(b.dataset.tab)));
   $('#tab-photo').addEventListener('click', () => $('#btn-render').click());
+  for (const b of [$('#btn-render'), $('#tab-photo')]) b.addEventListener('pointerenter', warmPathTracer, { once: true });
   $('#tab-export').addEventListener('click', () => $('#btn-export').click());
   $('#lb-close').addEventListener('click', closeLightbox);
   $('#lightbox').addEventListener('click', (e) => { if (e.target.id === 'lightbox') closeLightbox(); });

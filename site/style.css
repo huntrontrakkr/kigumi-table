@@ -531,6 +531,10 @@ details.cut tr[data-part]:hover td { color: var(--accent); }
 a { color: var(--ink); text-decoration-color: var(--hair); text-underline-offset: 3px; }
 a:hover { color: var(--accent); text-decoration-color: currentColor; }
 .lb-wait { display: grid; place-items: center; gap: 16px; padding: 70px 0 60px; color: var(--ink-2); }
+.lb-wait:has(.pt-preview:not([hidden])) { padding-top: 0; }
+.lb-wait:has(.pt-preview:not([hidden])) .spinner { display: none; }
+.pt-preview { display: block; max-width: 100%; max-height: 62vh; background: var(--paper-2); }
+.pt-preview[hidden] { display: none; }
 .lb-msg { padding: 8px 0 4px; max-width: 760px; }
 .lb-msg p { margin: 0 0 8px; }
 .lb-msg pre { max-height: 300px; overflow: auto; font: 11px/1.45 var(--mono); white-space: pre-wrap; background: var(--paper-2); padding: 10px 12px; border: 1px solid var(--hair-2); }

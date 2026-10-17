@@ -777,7 +777,7 @@ export class Viewer {
     const r = this.renderer;
     const cam = this.camera;
     const keep = { pos: cam.position.clone(), target: this.controls.target.clone(), ratio: r.getPixelRatio() };
-    this.frame(false, poses[view] || poses.hero);
+    if (view !== 'current') this.frame(false, poses[view] || poses.hero);
     // at most maxSide pixels a side (phones have small screens at high density)
     const side = Math.max(this.container.clientWidth, this.container.clientHeight, 1);
     r.setPixelRatio(Math.min(keep.ratio * scale, maxSide / side));
