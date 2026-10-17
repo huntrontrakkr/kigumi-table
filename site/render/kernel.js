@@ -22,7 +22,7 @@ const MAX_DIFFUSE = 6u;
 
 struct Params {
   size: vec4u,        // width, height, first sample index, samples this dispatch
-  band: vec4u,        // first row, rows, max path events, seed
+  band: vec4u,        // first block of the pass order, blocks, max path events, seed
   camPos: vec4f,      // xyz, pixel angle (rad)
   camRight: vec4f,    // right * tan(half horizontal fov)
   camUp: vec4f,       // up * tan(half vertical fov)
@@ -36,16 +36,21 @@ struct Params {
   backdrop: vec4f,    // radiance seen by the camera past everything; w: indirect clamp
   floorA: vec4f,      // floor albedo, w: floor height
   misc: vec4f,        // x: bump strength
-  bounds: vec4f,      // unused
+  offs: vec4u,        // geometry buffer offsets (vec4s): normals, materials, transforms; block stride
 }
 
+// Three storage buffers (some mobile adapters allow only four per stage): the
+// accumulation, the BVH nodes, and one geometry buffer holding the triangles
+// (v0, e1, e2), their normals and ids, the materials and the mesh transforms.
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read_write> accum: array<vec4f>;
 @group(0) @binding(2) var<storage, read> nodes: array<vec4f>;
-@group(0) @binding(3) var<storage, read> tris: array<vec4f>;
-@group(0) @binding(4) var<storage, read> shade: array<vec4u>;
-@group(0) @binding(5) var<storage, read> mats: array<vec4f>;
-@group(0) @binding(6) var<storage, read> xf: array<vec4f>;
+@group(0) @binding(3) var<storage, read> geo: array<vec4u>;
+
+fn triV(i: u32) -> vec4f { return bitcast<vec4f>(geo[i]); }               // 3 per triangle
+fn shadeAt(k: u32) -> vec4u { return geo[P.offs.x + k]; }                  // oct normals, ids
+fn mtl(i: u32) -> vec4f { return bitcast<vec4f>(geo[P.offs.y + i]); }     // 8 per material
+fn xform(i: u32) -> vec4f { return bitcast<vec4f>(geo[P.offs.z + i]); }   // 3 per mesh
 
 // ---------------------------------------------------------------- sampling
 // Owen-scrambled, shuffled Sobol points (Burley 2020, "Practical Hash-based Owen
@@ -199,9 +204,9 @@ fn closest(o: vec3f, d: vec3f, tmax: f32) -> Hit {
 }
 
 fn hitTri(k: u32, o: vec3f, d: vec3f, h: ptr<function, Hit>) {
-  let v0 = tris[3u * k].xyz;
-  let e1 = tris[3u * k + 1u].xyz;
-  let e2 = tris[3u * k + 2u].xyz;
+  let v0 = triV(3u * k).xyz;
+  let e1 = triV(3u * k + 1u).xyz;
+  let e2 = triV(3u * k + 2u).xyz;
   let pv = cross(d, e2);
   let id = 1.0 / dot(e1, pv);
   let s = o - v0;
@@ -256,13 +261,13 @@ fn transmit(o: vec3f, d: vec3f) -> vec3f {
         var h = Hit(BIG, 0.0, 0.0, NONE);
         hitTri(k, o, d, &h);
         if (h.tri == NONE) { continue; }
-        let m = bitcast<u32>(tris[3u * k].w);
-        let kind = u32(mats[MAT * m].x);
+        let m = bitcast<u32>(triV(3u * k).w);
+        let kind = u32(mtl(MAT * m).x);
         if (kind != KIND_GLASS) { return vec3f(0.0); }
-        let ng = normalize(cross(tris[3u * k + 1u].xyz, tris[3u * k + 2u].xyz));
+        let ng = normalize(cross(triV(3u * k + 1u).xyz, triV(3u * k + 2u).xyz));
         let ci = abs(dot(ng, d));
-        let m1 = mats[MAT * m + 1u];
-        let m2 = mats[MAT * m + 2u];
+        let m1 = mtl(MAT * m + 1u);
+        let m2 = mtl(MAT * m + 2u);
         let eta = 1.0 / m1.w;
         let ct = sqrt(max(1.0 - eta * eta * (1.0 - ci * ci), 1e-4));
         T *= (1.0 - fresnelDielectric(ci, eta)) * sqrt(m1.xyz) * exp(-m2.xyz * (0.5 * m2.w / ct));
@@ -350,11 +355,11 @@ struct Wood { col: vec3f, dr: f32, gh: vec3f }   // albedo, roughness offset, bu
 fn fwv(g: vec3f, fa: vec3f, fb: vec3f) -> f32 { return abs(dot(g, fa)) + abs(dot(g, fb)); }
 
 fn woodEval(p: vec3f, fa: vec3f, fb: vec3f, m: u32, isChar: bool) -> Wood {
-  let early = mats[MAT * m + 3u];
-  let late = mats[MAT * m + 4u].xyz;
-  let grain = mats[MAT * m + 5u];
-  let seed = mats[MAT * m + 6u];
-  let tint = mats[MAT * m + 7u].xyz;
+  let early = mtl(MAT * m + 3u);
+  let late = mtl(MAT * m + 4u).xyz;
+  let grain = mtl(MAT * m + 5u);
+  let seed = mtl(MAT * m + 6u);
+  let tint = mtl(MAT * m + 7u).xyz;
   var w: Wood;
   if (isChar) {
     // yakisugi: charred scales elongated along the grain, dark cracks
@@ -586,16 +591,16 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
     var s: Surf;
     if (onTri) {
       let k = h.tri;
-      let v0 = tris[3u * k];
-      let e1 = tris[3u * k + 1u].xyz;
-      let e2 = tris[3u * k + 2u].xyz;
+      let v0 = triV(3u * k);
+      let e1 = triV(3u * k + 1u).xyz;
+      let e2 = triV(3u * k + 2u).xyz;
       let p = v0.xyz + e1 * h.u + e2 * h.v;
       let ngo = normalize(cross(e1, e2));             // outward
-      let sh = shade[k];
+      let sh = shadeAt(k);
       var ns = normalize(octDecode(sh.x) * (1.0 - h.u - h.v) + octDecode(sh.y) * h.u + octDecode(sh.z) * h.v);
       let m = sh.w & 0xffffu;
       let mesh = sh.w >> 16u;
-      let m0 = mats[MAT * m];
+      let m0 = mtl(MAT * m);
       let kind = u32(m0.x);
       let entering = dot(d, ngo) < 0.0;
       let ng = select(-ngo, ngo, entering);           // faces the incoming ray
@@ -603,7 +608,7 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
 
       if (kind == KIND_GLASS) {
         // smooth dielectric: reflect or refract by Fresnel; absorption inside
-        let m1 = mats[MAT * m + 1u];
+        let m1 = mtl(MAT * m + 1u);
         let eta = select(m1.w, 1.0 / m1.w, entering);
         var n = ns;
         if (dot(n, d) >= 0.0) { n = ng; }
@@ -622,19 +627,25 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
           o = offsetRay(p, -ng);
           beta *= sqrt(m1.xyz);
           inGlass = entering;
-          sigma = mats[MAT * m + 2u].xyz;
+          sigma = mtl(MAT * m + 2u).xyz;
         }
         coneW = width;
+        // the event budget runs out inside long chains (light running along a
+        // sheet by total internal reflection): end with the studio it would
+        // reach rather than black, as if it got out here
+        if (depth + 1u >= P.band.z) {
+          L += clampInd(beta * envL(d), bounces > 0u);
+        }
         continue;
       }
 
       // opaque material
       var rough = m0.y;
-      var albedo = mats[MAT * m + 1u].xyz;
+      var albedo = mtl(MAT * m + 1u).xyz;
       if (kind == KIND_WOOD || kind == KIND_CHAR) {
-        let r0 = xf[3u * mesh];
-        let r1 = xf[3u * mesh + 1u];
-        let r2 = xf[3u * mesh + 2u];
+        let r0 = xform(3u * mesh);
+        let r1 = xform(3u * mesh + 1u);
+        let r2 = xform(3u * mesh + 2u);
         let pl = vec3f(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
         // footprint of the ray cone on the surface, stretched along the ray's slant
         let cv = max(abs(dot(d, ng)), 0.05);
@@ -703,26 +714,34 @@ fn radiance(px: u32, py: u32, si: u32, pix: u32) -> vec3f {
   return L;
 }
 
+// A dispatch covers band.y blocks of 8 rows: entries band.x .. of the pass order
+// (block j -> j * stride mod blocks, stride coprime with the block count), so
+// every dispatch holds a similar mix of floor, wood and glass and its time is
+// predictable from its size.
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let nb = (P.size.y + 7u) / 8u;
+  let j = P.band.x + gid.y / 8u;
+  if (gid.x >= P.size.x || gid.y >= P.band.y * 8u || j >= nb) { return; }
   let px = gid.x;
-  let py = gid.y + P.band.x;
-  if (px >= P.size.x || gid.y >= P.band.y || py >= P.size.y) { return; }
+  let py = ((j * P.offs.w) % nb) * 8u + gid.y % 8u;
+  if (py >= P.size.y) { return; }
   let idx = py * P.size.x + px;
   let pix = hash1(idx ^ hash1(P.band.w));
-  var sum = vec3f(0.0);
+  var sum = vec4f(0.0);
   for (var k = 0u; k < P.size.w; k++) {
     let c = radiance(px, py, P.size.z + k, pix);
     // drop NaN / inf samples (they would poison the pixel for good)
     let e = (bitcast<vec3u>(c) >> vec3u(23u)) & vec3u(0xffu);
-    if (all(e != vec3u(0xffu))) { sum += c; }
+    if (all(e != vec3u(0xffu))) { sum += vec4f(c, 1.0); }
   }
-  accum[idx] += vec4f(sum, 0.0);
+  // w counts the samples: a render can stop between any two dispatches
+  accum[idx] += sum;
 }
 `;
 
 export const resolveWGSL = /* wgsl */`
-struct R { size: vec4u, k: vec4f }     // width, height, -, -; 1 / samples, exposure, dither, -
+struct R { size: vec4u, k: vec4f }     // width, height, -, -; -, exposure, dither, -
 @group(0) @binding(0) var<uniform> U: R;
 @group(0) @binding(1) var<storage, read> accum: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> outPx: array<u32>;
@@ -754,11 +773,12 @@ fn hash1(x: u32) -> u32 {
   return v;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
-  if (i >= U.size.x * U.size.y) { return; }
-  let c = neutral(max(accum[i].xyz * (U.k.x * U.k.y), vec3f(0.0)));
+  if (gid.x >= U.size.x || gid.y >= U.size.y) { return; }
+  let i = gid.y * U.size.x + gid.x;
+  let a = accum[i];
+  let c = neutral(max(a.xyz * (U.k.y / max(a.w, 1.0)), vec3f(0.0)));
   let s = srgb(clamp(c, vec3f(0.0), vec3f(1.0))) * 255.0;
   // triangular dither of one step: no banding in the soft floor gradients
   let h = hash1(i * 3u + 1u);

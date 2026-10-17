@@ -1,18 +1,22 @@
 // Progressive GPU path tracer for "Render photo" (WebGPU compute).
 //
 //   import { renderPhoto } from './render/pathtracer.js';
-//   const blob = await renderPhoto({ viewer, view: 'hero', width: 1600, height: 1100,
-//                                    samples: 256, onProgress: (frac, spp) => {} });
+//   const blob = await renderPhoto({ viewer, view: 'hero', onProgress: (frac, spp) => {} });
+//   if (!blob) { /* no WebGPU, scene over the caps, or the GPU was lost: raster photo */ }
 //
 // Takes the visible meshes of viewer.model, builds a BVH on the CPU (bvh.js), and
-// path-traces them on the GPU (kernel.js) in a soft studio: a large warm key light
-// from viewer.keyDir, a cool fill, an environment of the background colour and an
+// path-traces them on the GPU (kernel.js) in a studio: a warm key light from
+// viewer.keyDir, a cool fill, an environment of the background colour and an
 // infinite matte paper floor whose colour is solved so it fades into the backdrop
 // like the live view.  Khronos PBR Neutral tone mapping, sRGB, PNG out.
-// Resolves to null when WebGPU is unavailable.
+//
+// Phones: no optional features; storage sizes only up to the adapter's own limits;
+// at most 3 storage buffers per stage; work split into dispatches of about 30 ms;
+// a time budget (budgetMs) after which it stops and delivers the samples so far;
+// triangle and memory caps beyond which it resolves to null.
 
 import { buildBVH, emptySlot } from './bvh.js';
-import { extractScene } from './scene.js';
+import { extractScene, countTriangles, MAT_VEC4, XF_VEC4 } from './scene.js';
 import { traceWGSL, resolveWGSL, PARAMS_BYTES } from './kernel.js';
 
 export const POSES = {
@@ -38,9 +42,23 @@ export const STUDIO = {
   bump: 1,
 };
 
-const TARGET_MS = 110;            // GPU time per submission (keeps the browser responsive)
-const MAX_EVENTS = 128;           // path vertices including glass interfaces (light entering a
-                                  // sheet's edge runs along it by total internal reflection)
+export const MOBILE = isMobile();
+
+// Defaults: desktop renders 1600 x 1100 at 256 samples (about 4 s on an RTX 3090);
+// phones 1200 x 825.  Both stop when the budget is spent, with what they have.
+export const DEFAULTS = {
+  width: MOBILE ? 1200 : 1600,
+  height: MOBILE ? 825 : 1100,
+  samples: 256,
+  budgetMs: 15000,                 // whole call: scene, BVH, tracing and the PNG
+  maxTriangles: MOBILE ? 500000 : 3000000,
+  maxPixels: MOBILE ? 2.5e6 : 16.8e6,
+};
+
+const DISPATCH_MS = 40;           // GPU time per dispatch: far below mobile watchdogs (2 s TDR)
+const MAX_EVENTS = 32;            // path vertices including glass interfaces: light entering a
+                                  // sheet's edge runs along it by total internal reflection; a
+                                  // longer chain costs one thread more time than a dispatch has
 
 export let lastStats = null;
 
@@ -48,9 +66,11 @@ let gpuPromise = null;
 let chain = Promise.resolve();
 
 // --------------------------------------------------------------------------- API
+// Resolves to a PNG Blob, or null when WebGPU is unavailable, the scene or image is
+// over the caps, or the GPU device was lost (lastStats.reason says which).  Rejects
+// with an AbortError when `signal` aborts.
 export function renderPhoto(opts = {}) {
-  // one render at a time
-  const run = chain.then(() => render(opts));
+  const run = chain.then(() => render(opts));        // one render at a time
   chain = run.catch(() => {});
   return run;
 }
@@ -62,16 +82,27 @@ export async function disposePathTracer() {
   if (g && g.own) g.device.destroy();
 }
 
-async function render({ viewer, view = 'hero', width = 1600, height = 1100, samples = 256, onProgress, signal,
-  studio = STUDIO, _wgsl } = {}) {
+async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = DEFAULTS.height, samples = DEFAULTS.samples,
+  budgetMs = DEFAULTS.budgetMs, maxTriangles = DEFAULTS.maxTriangles, onProgress, signal, studio = STUDIO, _wgsl, _dispatchMs } = {}) {
   if (!viewer || !viewer.model) throw new Error('renderPhoto: the viewer has no model');
   const T0 = performance.now();
-  const gpu = await getGPU(viewer);
-  if (!gpu) return null;
-  const { device } = gpu;
+  const fail = (reason, extra = {}) => { lastStats = { reason, ...extra }; return null; };
   width = Math.max(8, Math.round(width));
   height = Math.max(8, Math.round(height));
   samples = Math.max(1, Math.round(samples));
+  const pixels = width * height;
+  if (pixels > DEFAULTS.maxPixels) return fail('image too large', { pixels });
+
+  // the scene's size first: nothing big is allocated for a scene over the cap
+  const triCount = countTriangles(viewer.model);
+  if (triCount > maxTriangles) return fail('too many triangles', { triangles: triCount, maxTriangles });
+
+  const gpu = await getGPU(viewer);
+  if (!gpu) return fail('no WebGPU');
+  const { device } = gpu;
+  const lim = device.limits;
+  const maxBinding = Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize);
+  if (pixels * 16 > maxBinding) return fail('image too large for this GPU', { pixels });
 
   const cam = cameraFor(viewer, view, width / height);
   const sc = extractScene(viewer.model);
@@ -79,57 +110,65 @@ async function render({ viewer, view = 'hero', width = 1600, height = 1100, samp
   const T1 = performance.now();
   const lights = lighting(viewer, studio);
 
-  // ---- GPU buffers
+  // ---- scene buffers: BVH nodes, and the geometry buffer (see kernel.js)
   const N = sc.count;
-  const tri = new Float32Array(Math.max(1, N) * 12);
-  const triU = new Uint32Array(tri.buffer);
-  const shade = new Uint32Array(Math.max(1, N) * 4);
+  const nT = Math.max(1, N);
+  const offShade = 3 * nT, offMats = 4 * nT, offXf = offMats + sc.nMats * MAT_VEC4;
+  const geoVec4 = offXf + Math.max(1, sc.nMeshes) * XF_VEC4;
+  const nodes = N ? bvh.nodes : emptyNodes();
+  if (geoVec4 * 16 > maxBinding || nodes.byteLength > maxBinding) {
+    return fail('scene too large for this GPU', { triangles: N, bytes: geoVec4 * 16 + nodes.byteLength, maxBinding });
+  }
+  const geo = new Uint32Array(geoVec4 * 4);
+  const geoF = new Float32Array(geo.buffer);
   const ord = bvh.order, P = sc.pos, Nr = sc.nrm, ids = sc.ids;
   for (let k = 0; k < N; k++) {
-    const s = ord[k], o = 9 * s, b = 12 * k;
-    tri[b] = P[o]; tri[b + 1] = P[o + 1]; tri[b + 2] = P[o + 2];
-    tri[b + 4] = P[o + 3] - P[o]; tri[b + 5] = P[o + 4] - P[o + 1]; tri[b + 6] = P[o + 5] - P[o + 2];
-    tri[b + 8] = P[o + 6] - P[o]; tri[b + 9] = P[o + 7] - P[o + 1]; tri[b + 10] = P[o + 8] - P[o + 2];
-    triU[b + 3] = ids[s] & 0xffff;
-    shade[4 * k] = oct(Nr[o], Nr[o + 1], Nr[o + 2]);
-    shade[4 * k + 1] = oct(Nr[o + 3], Nr[o + 4], Nr[o + 5]);
-    shade[4 * k + 2] = oct(Nr[o + 6], Nr[o + 7], Nr[o + 8]);
-    shade[4 * k + 3] = ids[s];
+    const s = ord[k], o = 9 * s, b = 12 * k, h = 4 * (offShade + k);
+    geoF[b] = P[o]; geoF[b + 1] = P[o + 1]; geoF[b + 2] = P[o + 2];
+    geoF[b + 4] = P[o + 3] - P[o]; geoF[b + 5] = P[o + 4] - P[o + 1]; geoF[b + 6] = P[o + 5] - P[o + 2];
+    geoF[b + 8] = P[o + 6] - P[o]; geoF[b + 9] = P[o + 7] - P[o + 1]; geoF[b + 10] = P[o + 8] - P[o + 2];
+    geo[b + 3] = ids[s] & 0xffff;
+    geo[h] = oct(Nr[o], Nr[o + 1], Nr[o + 2]);
+    geo[h + 1] = oct(Nr[o + 3], Nr[o + 4], Nr[o + 5]);
+    geo[h + 2] = oct(Nr[o + 6], Nr[o + 7], Nr[o + 8]);
+    geo[h + 3] = ids[s];
   }
-  const nodes = N ? bvh.nodes : emptyNodes();
-  const bufs = [];
-  const mk = (data, usage) => {
-    const b = device.createBuffer({ size: Math.max(16, align(data.byteLength, 16)), usage: usage | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength);
-    bufs.push(b);
-    return b;
-  };
-  const S = GPUBufferUsage.STORAGE;
-  const bNodes = mk(nodes, S);
-  const bTris = mk(tri, S);
-  const bShade = mk(shade, S);
-  const bMats = mk(sc.mats, S);
-  const bXf = mk(sc.xforms, S);
-  const pixels = width * height;
-  const bAccum = device.createBuffer({ size: pixels * 16, usage: S | GPUBufferUsage.COPY_DST });
-  bufs.push(bAccum);
-  device.queue.writeBuffer(bAccum, 0, new Float32Array(pixels * 4));
-  const bParams = device.createBuffer({ size: PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  bufs.push(bParams);
-  const bOut = device.createBuffer({ size: pixels * 4, usage: S | GPUBufferUsage.COPY_SRC });
-  const bRead = device.createBuffer({ size: pixels * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-  const bRes = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  bufs.push(bOut, bRead, bRes);
+  geoF.set(sc.mats, 4 * offMats);
+  geoF.set(sc.xforms.subarray(0, sc.nMeshes * XF_VEC4 * 4), 4 * offXf);
 
+  const bufs = [];
+  const lost = { flag: false };
+  const lostWatch = device.lost.then(() => { lost.flag = true; });
+  const make = (size, usage) => { const b = device.createBuffer({ size: Math.max(16, align(size, 16)), usage }); bufs.push(b); return b; };
+  const S = GPUBufferUsage.STORAGE, D = GPUBufferUsage.COPY_DST;
   try {
+    device.pushErrorScope('out-of-memory');
+    device.pushErrorScope('validation');
+    const bNodes = make(nodes.byteLength, S | D);
+    device.queue.writeBuffer(bNodes, 0, nodes.buffer, nodes.byteOffset, nodes.byteLength);
+    const bGeo = make(geo.byteLength, S | D);
+    device.queue.writeBuffer(bGeo, 0, geo.buffer, 0, geo.byteLength);
+    const bAccum = make(pixels * 16, S | D);          // WebGPU buffers start zeroed
+    const bParams = make(PARAMS_BYTES, GPUBufferUsage.UNIFORM | D);
+    const bOut = make(pixels * 4, S | GPUBufferUsage.COPY_SRC);
+    const bRead = make(pixels * 4, GPUBufferUsage.MAP_READ | D);
+    const bRes = make(32, GPUBufferUsage.UNIFORM | D);
+
     // _wgsl: a patched kernel source (tests only), compiled for this render
     const { trace, resolve } = await (_wgsl ? compile(device, _wgsl) : gpu.pipelines);
-    const T2 = performance.now();
-    device.pushErrorScope('validation');
     const bgTrace = device.createBindGroup({
       layout: trace.getBindGroupLayout(0),
-      entries: [bParams, bAccum, bNodes, bTris, bShade, bMats, bXf].map((buffer, binding) => ({ binding, resource: { buffer } })),
+      entries: [bParams, bAccum, bNodes, bGeo].map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
+    const bgResolve = device.createBindGroup({
+      layout: resolve.getBindGroupLayout(0),
+      entries: [bRes, bAccum, bOut].map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+    const vErr = await device.popErrorScope();
+    const mErr = await device.popErrorScope();
+    if (mErr) return fail('out of GPU memory', { message: mErr.message });
+    if (vErr) throw new Error('path tracer: ' + vErr.message);
+    const T2 = performance.now();
 
     // ---- progressive passes
     const params = new ArrayBuffer(PARAMS_BYTES);
@@ -150,64 +189,98 @@ async function render({ viewer, view = 'hero', width = 1600, height = 1100, samp
     setV(12, lights.backdrop, studio.clamp ?? STUDIO.clamp);
     setV(13, lights.floor, 0);
     setV(14, [studio.bump ?? 1, 0, 0]);
+    pu[60] = offShade; pu[61] = offMats; pu[62] = offXf;
 
-    let spp = 0;
-    let k = 1, rows = Math.min(height, 128);
-    let traceMs = 0;
-    let chunks = 0;
-    while (spp < samples) {
-      const kk = Math.min(k, samples - spp);
-      let passMs = 0;
-      for (let y0 = 0; y0 < height; y0 += rows) {
+    // Dispatches: a pass visits the 8-row blocks in a strided order (see the
+    // kernel), each dispatch taking the next n blocks, spread over the image, so
+    // they all hold a similar mix of floor, wood and glass and their time is close
+    // to proportional to n.  n follows the measured time towards the target (at
+    // most 2x per step, from 2 blocks); once a dispatch holds the whole frame,
+    // the number of samples per dispatch follows it the same way.
+    const dispatchMs = _dispatchMs || DISPATCH_MS;
+    const aim = 0.75 * dispatchMs;
+    const reserveMs = 100 + pixels * (MOBILE ? 6e-4 : 2e-4);    // resolve, read back, PNG
+    const nb = Math.ceil(height / 8);
+    let stride = Math.max(1, Math.round(nb * 0.618));
+    while (gcd(stride, nb) !== 1) stride++;
+    pu[63] = stride;
+    let n = Math.min(nb, 2);     // blocks per dispatch
+    let k = 1;                   // samples per dispatch, once n covers the frame
+    let perBlock = 0;            // ms per block-sample (moving average, for the budget)
+    let spp = 0;                 // complete passes (every pixel has at least this many samples)
+    let traceMs = 0, dispatches = 0, maxDispatchMs = 0, stopped = '';
+    const slowest = [];          // the five longest dispatches [ms, spp, first block, blocks, samples]
+    // progress: samples done of those asked, or time spent of the budget, whichever
+    // is further along (the budget usually decides on slow GPUs)
+    let reported = 0;
+    const report = (sppDone) => {
+      const f = Math.min(0.99, Math.max(sppDone / samples, (performance.now() - T0) / budgetMs));
+      if (f > reported) { reported = f; onProgress?.(f, Math.floor(sppDone)); }
+    };
+    passes: while (spp < samples) {
+      const whole = n >= nb;
+      const kk = whole ? Math.min(k, samples - spp) : 1;
+      for (let s0 = 0; s0 < nb;) {
         if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
-        const r = Math.min(rows, height - y0);
-        pu[2] = spp; pu[3] = kk; pu[4] = y0; pu[5] = r;
+        const m = Math.min(whole ? nb : n, nb - s0);
+        // the budget: stop between dispatches once the next one would overrun it
+        // (sample counts are kept per pixel, so a partial pass is fine)
+        if (spp > 0 && performance.now() - T0 + perBlock * m * kk + reserveMs > budgetMs) { stopped = 'budget'; break passes; }
+        pu[2] = spp; pu[3] = kk; pu[4] = s0; pu[5] = m;
         device.queue.writeBuffer(bParams, 0, params);
         const enc = device.createCommandEncoder();
         const pass = enc.beginComputePass();
         pass.setPipeline(trace);
         pass.setBindGroup(0, bgTrace);
-        pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(r / 8));
+        pass.dispatchWorkgroups(Math.ceil(width / 8), m);
         pass.end();
         const t = performance.now();
         device.queue.submit([enc.finish()]);
-        if (chunks === 0) {
-          const err = await device.popErrorScope();
-          if (err) throw new Error('path tracer: ' + err.message);
-        }
-        await device.queue.onSubmittedWorkDone();
+        await Promise.race([device.queue.onSubmittedWorkDone(), lostWatch]);
+        if (lost.flag) return fail('GPU device lost', { dispatches, spp });
         const dt = performance.now() - t;
-        passMs += dt;
-        chunks++;
-        onProgress?.(Math.min(1, (spp + kk * (y0 + r) / height) / samples), spp + (y0 + r >= height ? kk : 0));
+        traceMs += dt;
+        dispatches++;
+        maxDispatchMs = Math.max(maxDispatchMs, dt);
+        if (slowest.length < 5 || dt > slowest[4][0]) {
+          slowest.push([Math.round(dt), spp, s0, m, kk]);
+          slowest.sort((a, b) => b[0] - a[0]);
+          slowest.length = Math.min(slowest.length, 5);
+        }
+        perBlock = perBlock ? 0.7 * perBlock + 0.3 * dt / (m * kk) : dt / (m * kk);
+        const f = Math.min(2, Math.max(0.5, aim / Math.max(dt, 0.1)));
+        if (whole) {
+          if (dt > dispatchMs && kk === 1) n = Math.max(1, Math.floor(nb * aim / dt));   // back to parts
+          else k = Math.max(1, Math.min(16, Math.floor(kk * f)));
+        } else {
+          n = Math.max(1, Math.min(nb, Math.round(m * f)));
+        }
+        s0 += m;
+        report(spp + kk * s0 / nb);
       }
       spp += kk;
-      traceMs += passMs;
-      // next pass: aim for TARGET_MS per submission
-      const perPixelSample = passMs / (kk * pixels);
-      const budget = TARGET_MS / Math.max(perPixelSample, 1e-9);     // pixel-samples per submission
-      if (budget >= pixels) { rows = height; k = Math.max(1, Math.min(32, Math.floor(budget / pixels))); }
-      else { k = 1; rows = Math.max(8, Math.min(height, Math.floor(budget / width / 8) * 8)); }
     }
     const T3 = performance.now();
 
     // ---- resolve, read back, encode
     const ru = new Uint32Array(8), rf = new Float32Array(ru.buffer);
     ru[0] = width; ru[1] = height;
-    rf[4] = 1 / samples; rf[5] = lights.exposure; rf[6] = 1;
+    rf[5] = lights.exposure; rf[6] = 1;
     device.queue.writeBuffer(bRes, 0, ru);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(resolve);
-    pass.setBindGroup(0, device.createBindGroup({
-      layout: resolve.getBindGroupLayout(0),
-      entries: [bRes, bAccum, bOut].map((buffer, binding) => ({ binding, resource: { buffer } })),
-    }));
-    pass.dispatchWorkgroups(Math.ceil(pixels / 256));
+    pass.setBindGroup(0, bgResolve);
+    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
     pass.end();
     enc.copyBufferToBuffer(bOut, 0, bRead, 0, pixels * 4);
     device.queue.submit([enc.finish()]);
-    await bRead.mapAsync(GPUMapMode.READ);
+    try {
+      await bRead.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      if (lost.flag) return fail('GPU device lost', { dispatches, spp });
+      throw e;
+    }
     const rgba = new Uint8ClampedArray(bRead.getMappedRange().slice(0));
     bRead.unmap();
     const blob = await encodePNG(rgba, width, height);
@@ -215,10 +288,11 @@ async function render({ viewer, view = 'hero', width = 1600, height = 1100, samp
     lastStats = {
       triangles: N, meshes: sc.nMeshes, materials: sc.nMats, bvhNodes: bvh.nodeCount, bvhDepth: bvh.depth,
       extractMs: Math.round(sc.ms), bvhMs: Math.round(bvh.ms), setupMs: Math.round(T2 - T1), traceMs: Math.round(traceMs),
-      outputMs: Math.round(T4 - T3), totalMs: Math.round(T4 - T0), samples, width, height, chunks,
-      msPerSample: +(traceMs / samples).toFixed(2),
-      adapter: gpu.info,
+      outputMs: Math.round(T4 - T3), totalMs: Math.round(T4 - T0), samples: spp, requested: samples, stopped,
+      width, height, dispatches, maxDispatchMs: Math.round(maxDispatchMs), slowest, msPerSample: +(traceMs / Math.max(spp, 1)).toFixed(2),
+      gpuBytes: nodes.byteLength + geo.byteLength + pixels * 24, adapter: gpu.info, limits: gpu.requested, mobile: MOBILE,
     };
+    onProgress?.(1, spp);
     return blob;
   } finally {
     for (const b of bufs) b.destroy();
@@ -226,27 +300,32 @@ async function render({ viewer, view = 'hero', width = 1600, height = 1100, samp
 }
 
 // --------------------------------------------------------------------------- GPU
+// Our own device (the viewer's when that fails): no optional features; the two
+// storage size limits raised only as far as the adapter allows (big scenes on
+// desktop GPUs); everything else at the WebGPU defaults.  Used: 3 storage buffers
+// and 1 uniform per stage, 64-thread (trace) and 256-thread (resolve) workgroups,
+// no workgroup memory.
 function getGPU(viewer) {
   if (gpuPromise) return gpuPromise;
   const p = (async () => {
     if (typeof navigator === 'undefined' || !navigator.gpu) return null;
-    let device = null, own = true, info = '';
+    let device = null, own = true, info = '', requested = {};
+    let adapter = null;
     try {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-      if (adapter) {
-        const lim = adapter.limits;
-        device = await adapter.requestDevice({
-          requiredLimits: {
-            maxStorageBufferBindingSize: Math.min(lim.maxStorageBufferBindingSize, 1 << 30),
-            maxBufferSize: Math.min(lim.maxBufferSize, 1 << 30),
-            maxStorageBuffersPerShaderStage: Math.min(lim.maxStorageBuffersPerShaderStage, 8),
-          },
-        });
-        const ai = adapter.info || {};
-        info = [ai.vendor, ai.architecture, ai.description].filter(Boolean).join(' ');
+      adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    } catch (e) { adapter = null; }
+    if (adapter) {
+      const al = adapter.limits;
+      const want = {};
+      for (const k of ['maxStorageBufferBindingSize', 'maxBufferSize']) {
+        const v = Math.min(al[k] || 0, 1 << 30);
+        if (v > 0) want[k] = v;
       }
-    } catch (e) {
-      device = null;
+      for (const req of [want, {}]) {
+        try { device = await adapter.requestDevice({ requiredLimits: req }); requested = req; break; } catch (e) { device = null; }
+      }
+      const ai = adapter.info || {};
+      info = [ai.vendor, ai.architecture, ai.description].filter(Boolean).join(' ');
     }
     if (!device) {
       // fall back on the viewer's own device when three.js runs on WebGPU
@@ -254,10 +333,10 @@ function getGPU(viewer) {
       own = false;
     }
     if (!device) return null;
-    if (own) device.lost.then(() => { if (gpuPromise === p) gpuPromise = null; });
+    device.lost.then(() => { if (gpuPromise === p) gpuPromise = null; });
     const pipelines = compile(device);
     pipelines.catch(() => { if (gpuPromise === p) gpuPromise = null; });
-    return { device, own, info, pipelines };
+    return { device, own, info, pipelines, requested };
   })().catch(() => null);
   gpuPromise = p;
   return p;
@@ -277,6 +356,13 @@ async function compile(device, code = traceWGSL) {
     device.createComputePipelineAsync({ layout: 'auto', compute: { module: rm, entryPoint: 'main' } }),
   ]);
   return { trace, resolve };
+}
+
+function isMobile() {
+  if (typeof navigator === 'undefined') return false;
+  if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') return navigator.userAgentData.mobile;
+  const ua = navigator.userAgent || '';
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
 }
 
 // --------------------------------------------------------------------------- camera
@@ -380,6 +466,7 @@ function inverseNeutral(target, exposure) {
 
 // --------------------------------------------------------------------------- helpers
 function align(n, a) { return Math.ceil(n / a) * a; }
+function gcd(a, b) { while (b) { [a, b] = [b, a % b]; } return a; }
 
 function emptyNodes() {
   const f = new Float32Array(16), u = new Uint32Array(f.buffer);

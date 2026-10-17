@@ -2,6 +2,9 @@
 // Run through cdp.sh; the module is loaded fresh from serve.py (never cached).
 //   run({ view, width, height, samples, name, studio, params, glass, explode })
 //   run({ batch: [ {...}, {...} ] })        several renders in one page session
+const LOG = (o) => { try { fetch('http://localhost:8791/log', { method: 'POST', body: JSON.stringify(o) }); } catch (e) { /* ignore */ } };
+let lastLog = 0;
+const logProgress = (f, s) => { const t = performance.now(); if (t - lastLog > 500) { lastLog = t; LOG({ f: +f.toFixed(3), s, t: Math.round(t) }); } };
 export async function run(cfg = {}) {
   const m = await import(`http://localhost:8791/render/pathtracer.js?t=${Date.now()}`);
   if (cfg.batch) {
@@ -24,7 +27,7 @@ async function one(m, { view = 'hero', width = 800, height = 550, samples = 16, 
   }
   const marks = [];
   const t0 = performance.now();
-  opts.onProgress = (f, s) => { if (marks.length < 400) marks.push([+f.toFixed(3), s, Math.round(performance.now() - t0)]); };
+  opts.onProgress = (f, s) => { logProgress(f, s); if (marks.length < 400) marks.push([+f.toFixed(3), s, Math.round(performance.now() - t0)]); };
   const blob = await m.renderPhoto(opts);
   const ms = Math.round(performance.now() - t0);
   if (!blob) return { error: 'no WebGPU' };

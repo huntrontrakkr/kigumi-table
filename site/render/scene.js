@@ -70,6 +70,18 @@ function isGlass(mat) {
 
 function num(v, d) { return typeof v === 'number' && isFinite(v) ? v : d; }
 
+// Triangles extractScene would produce (before dropping degenerate ones), without
+// allocating anything: callers check it against their caps first.
+export function countTriangles(root) {
+  let total = 0;
+  root.traverseVisible((o) => {
+    if (!o.isMesh || !o.geometry?.attributes?.position) return;
+    const n = triRanges(o).reduce((a, r) => a + r.count, 0);
+    total += o.isInstancedMesh ? n * o.count : n;
+  });
+  return total;
+}
+
 // root: THREE.Object3D (the viewer's model group).  Visible meshes only.
 // Returns { count, pos: Float32Array(9n), nrm: Float32Array(9n), ids: Uint32Array(n)
 // ((mesh << 16) | material), mats: Float32Array, xforms: Float32Array, nMats, nMeshes, ms }.
