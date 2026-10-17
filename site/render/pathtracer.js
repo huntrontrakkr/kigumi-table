@@ -362,11 +362,18 @@ async function compile(device, code = traceWGSL) {
   return { trace, resolve };
 }
 
+// Phones and tablets: the UA's own flag or name, an iPad posing as a Mac, or (as the
+// viewer decides its low-power mode) a coarse pointer on a small screen.
 function isMobile() {
   if (typeof navigator === 'undefined') return false;
-  if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') return navigator.userAgentData.mobile;
+  if (navigator.userAgentData?.mobile === true) return true;
   const ua = navigator.userAgent || '';
-  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return true;
+  try {
+    return matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) <= 900;
+  } catch (e) {
+    return false;
+  }
 }
 
 // --------------------------------------------------------------------------- worker
