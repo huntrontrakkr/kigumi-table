@@ -5,8 +5,8 @@ legs, a field, a grid; the program lays out a flat lattice of notched strips, wo
 joint, checks that the table stands up, and writes the files a workshop needs to make it.
 
 **[Open the configurator →](https://huntrontrakkr.github.io/kigumi-table/)** It runs entirely in your
-browser: the Python design engine in WebAssembly, the structural solver and the renderer on your GPU
-(WebGPU).
+browser, phones included: the Python design engine and its structural solver in WebAssembly, the
+renderer and the photo path tracer on your GPU (WebGPU).
 
 ![Configurator](docs/images/configurator.jpg)
 
@@ -40,10 +40,13 @@ browser: the Python design engine in WebAssembly, the structural solver and the 
   40 MB; later visits come from the browser cache.
 * **Solids.** [Manifold](https://github.com/elalish/manifold)'s WebAssembly build makes the solids and
   booleans; `kigumi/_m3d_web.py` shims the subset of the `manifold3d` API that the package uses.
-* **Solver.** Large linear systems (the plate, the structural grillage) go to a WebGPU solver
-  (`site/engine/gpu/`). It runs conjugate gradients in WGSL on the GPU with a sparse approximate
-  inverse preconditioner, refined in double precision on the CPU. Python waits on the GPU through
-  JavaScript Promise Integration. Without WebGPU, the solves stay on SuperLU in WebAssembly.
+* **Solver.** The structural systems (the glass plate, the grillage with its contacts) are solved
+  by SuperLU in WebAssembly. A WebGPU solver is included too (`site/engine/gpu/`): conjugate
+  gradients in WGSL with a sparse approximate inverse preconditioner, refined to double precision on
+  the CPU, Python waiting on the GPU through JavaScript Promise Integration. Measured on an RTX 3090
+  it is 3–9x *slower* than SuperLU on these systems (a fourth-order plate needs CG iterations in
+  proportion to its size, while a sparse Cholesky of a 2D mesh stays cheap), so it is off unless
+  you add `?gpu-solver` to the address. `tools/gpu-test/NOTES.md` has the numbers.
 * **Rendering.** three.js `WebGPURenderer`, with the procedural wood written in TSL (compiled to
   WGSL, or GLSL on the WebGL2 fallback). **Render photo** path-traces the scene on the GPU
   (`site/render/`) instead of Blender.
@@ -51,13 +54,22 @@ browser: the Python design engine in WebAssembly, the structural solver and the 
   drawings, cut list, `FABRICATION.md`, GLB and STL. STEP and Rhino `.3dm` come from the Python
   package on your own machine.
 
-Best in a current Chrome or Edge (WebGPU and JS Promise Integration). Other browsers fall back to
-WebGL2 and CPU solves.
+Tested in Chrome on Windows (WebGPU on an RTX 3090) and, headless, in Firefox, in WebKit
+(Safari's engine) emulating an iPhone, and in Chromium emulating Android phones. Browsers without
+JavaScript Promise Integration (Safari, Firefox) call Python directly. Without WebGPU the view falls
+back to WebGL2, and **Render photo** to a rasterised still. On a phone:
+
+* the panels open as sheets from a tab bar;
+* a tap on a part inspects it;
+* the view lowers its resolution if frames come slowly.
+
+A design change takes a few seconds on a desktop; phones take longer.
 
 Develop locally: `uv run python scripts/build_site.py` (packs the Python sources into
 `site/py/kigumi.zip`), then serve `site/` with any static server, e.g. `python3 -m http.server -d site`.
-`tools/web-engine-test/run.mjs` runs the same engine under Node, and `tools/gpu-test/` tests the GPU
-solver.
+`tools/web-engine-test/run.mjs` runs the same engine under Node, `tools/gpu-test/` tests the GPU
+solver, and `tools/ui-test/mobile-smoke.mjs` drives the page as an iPhone (WebKit) or an Android
+phone (Chromium) by touch.
 
 ## Run locally (Python)
 
@@ -225,8 +237,13 @@ one-metre top.
 * **Organic layouts need checking.** Spiral, scatter, wave and free layouts are asymmetric by
   nature. Where the outline reaches far past the feet, the table can tip under a hand on the rim,
   and the tipping check flags it. Pull the field in, lean the feet out, or add a leg.
-* Front-end tests: `cd tools/ui-test && node ui-test.mjs --url http://127.0.0.1:8765/ --quick`
-  (local server) and `node site-smoke.mjs --url http://localhost:8790/` (browser build).
+* Front-end tests, all in `tools/ui-test`:
+  * `node ui-test.mjs --url http://127.0.0.1:8765/ --quick`: the local server.
+  * `node site-smoke.mjs --url http://localhost:8790/ [--browser firefox|webkit]`: the browser build.
+  * `node mobile-smoke.mjs --browser webkit|chromium [--landscape 1] [--export 1]`: phones.
+
+  On Linux, WebKit needs its system libraries. Set `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1`
+  if they are installed somewhere private.
 * Wood moves across the grain, so notches are cut with 0.15 mm clearance a side and the caps can be
   re-snugged seasonally.
 

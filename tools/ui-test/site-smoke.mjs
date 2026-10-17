@@ -1,7 +1,7 @@
 // Smoke test of the browser build (site/): boots the engine (Pyodide from the
 // CDN), waits for the first design and its checks, takes a screenshot.
 //   node site-smoke.mjs --url http://localhost:8790/
-import { chromium } from 'playwright';
+import { chromium, firefox, webkit } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? process.argv[i + 1] : d; };
@@ -15,8 +15,14 @@ if (fs.existsSync(deps)) env.LD_LIBRARY_PATH = deps + (env.LD_LIBRARY_PATH ? ':'
 // draw with (old texture-view swizzle); by default the viewer falls back to
 // WebGL2 here.  --webgpu 1 turns SwiftShader's WebGPU on anyway.
 const gpuArgs = arg('webgpu', '') ? ['--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] : [];
-const browser = await chromium.launch({ headless: true, env,
-  args: [...gpuArgs, '--enable-features=WebAssemblyJSPromiseIntegration'] });
+const which = arg('browser', 'chromium');
+const gio = path.join(process.env.HOME || '', '.local/lib/webkitdeps/gio');      // TLS for WebKit
+if (fs.existsSync(gio)) env.GIO_EXTRA_MODULES = gio;
+const wk = path.join(process.env.HOME || '', '.local/lib/webkitdeps');
+if (which !== 'chromium' && fs.existsSync(wk)) env.LD_LIBRARY_PATH = wk + ':' + (env.LD_LIBRARY_PATH || '');
+const browser = which === 'chromium'
+  ? await chromium.launch({ headless: true, env, args: [...gpuArgs, '--enable-features=WebAssemblyJSPromiseIntegration'] })
+  : await (which === 'firefox' ? firefox : webkit).launch({ headless: true, env });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 page.setDefaultTimeout(600_000);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
