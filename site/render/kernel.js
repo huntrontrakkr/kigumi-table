@@ -773,7 +773,7 @@ fn hash1(x: u32) -> u32 {
   return v;
 }
 
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= U.size.x || gid.y >= U.size.y) { return; }
   let i = gid.y * U.size.x + gid.x;

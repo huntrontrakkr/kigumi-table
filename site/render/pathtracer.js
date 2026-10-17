@@ -67,11 +67,17 @@ let chain = Promise.resolve();
 
 // --------------------------------------------------------------------------- API
 // Resolves to a PNG Blob, or null when WebGPU is unavailable, the scene or image is
-// over the caps, or the GPU device was lost (lastStats.reason says which).  Rejects
-// with an AbortError when `signal` aborts.
+// over the caps, the GPU device was lost or anything else failed (lastStats.reason
+// says which; the caller falls back on the raster photo).  Rejects only with an
+// AbortError when `signal` aborts.
 export function renderPhoto(opts = {}) {
-  const run = chain.then(() => render(opts));        // one render at a time
-  chain = run.catch(() => {});
+  const run = chain.then(() => render(opts)).catch((e) => {
+    if (e && e.name === 'AbortError') throw e;
+    console.warn('path tracer:', e);
+    lastStats = { reason: 'error', message: String((e && e.message) || e) };
+    return null;
+  });
+  chain = run.catch(() => {});                        // one render at a time
   return run;
 }
 
@@ -96,9 +102,12 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
   if (!viewer || !viewer.model) throw new Error('renderPhoto: the viewer has no model');
   const T0 = performance.now();
   const fail = (reason, extra = {}) => { lastStats = { reason, ...extra }; return null; };
-  width = Math.max(8, Math.round(width));
-  height = Math.max(8, Math.round(height));
-  samples = Math.max(1, Math.round(samples));
+  const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  width = Math.max(8, Math.round(num(width, DEFAULTS.width)));
+  height = Math.max(8, Math.round(num(height, DEFAULTS.height)));
+  samples = Math.max(1, Math.round(num(samples, DEFAULTS.samples)));
+  budgetMs = Math.max(0, num(budgetMs, DEFAULTS.budgetMs));
+  maxTriangles = num(maxTriangles, DEFAULTS.maxTriangles);
   const pixels = width * height;
   if (pixels > DEFAULTS.maxPixels) return fail('image too large', { pixels });
 
@@ -263,7 +272,7 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
     const pass = enc.beginComputePass();
     pass.setPipeline(resolve);
     pass.setBindGroup(0, bgResolve);
-    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+    pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
     pass.end();
     enc.copyBufferToBuffer(bOut, 0, bRead, 0, pixels * 4);
     device.queue.submit([enc.finish()]);
@@ -295,9 +304,11 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
 // --------------------------------------------------------------------------- GPU
 // Our own device (the viewer's when that fails): no optional features; the two
 // storage size limits raised only as far as the adapter allows (big scenes on
-// desktop GPUs); everything else at the WebGPU defaults.  Used: 3 storage buffers
-// and 1 uniform per stage, 64-thread (trace) and 256-thread (resolve) workgroups,
-// no workgroup memory.
+// desktop GPUs; retried with no limits if refused); everything else at the WebGPU
+// defaults.  Used: 1 bind group, 3 storage buffers and 1 uniform per stage (the
+// resolve pass 2 + 1), 8x8 workgroups (64 invocations), no workgroup memory, at
+// most ceil(width / 8) x ceil(height / 8) workgroups per dispatch.  All within
+// the compatibility-mode minimums (4 storage buffers, 128 invocations).
 function getGPU(viewer) {
   if (gpuPromise) return gpuPromise;
   const p = (async () => {
