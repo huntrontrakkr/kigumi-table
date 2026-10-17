@@ -2,7 +2,8 @@
 
     uv run python -m kigumi.server [--port 8765]
 
-GET  /                 web/index.html
+GET  /                 site/index.html (the GitHub Pages page; served from here it
+                       uses this server instead of the in-page WebAssembly engine)
 GET  /api/schema       parameter table (groups, ranges, choices), presets
 POST /api/build        {params} -> {id, glb, report}
 POST /api/random       {seed?, keep?: [names], base?: {params}, jitter?: 0..1, candidates?: n}
@@ -33,7 +34,7 @@ from .params import PRESETS, Params, preset, sample, schema
 from .report import summarize
 
 ROOT = Path(__file__).resolve().parent.parent
-WEB = (ROOT / "web").resolve()
+WEB = (ROOT / "site").resolve()
 OUT = ROOT / "out" / "server"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +115,10 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         try:
             if path == "/" or path == "/index.html":
-                return self._file(WEB / "index.html")
+                # the page asks this server instead of starting its own engine
+                html = (WEB / "index.html").read_text(encoding="utf-8")
+                html = html.replace("<head>", '<head>\n<meta name="kigumi-server" content="1">', 1)
+                return self._send(200, html.encode(), "text/html; charset=utf-8")
             if path == "/api/schema":
                 return self._json(dict(params=schema(), presets={k: preset(k).to_dict() for k in PRESETS}))
             if path.startswith("/api/checks/"):
@@ -194,8 +198,10 @@ class Handler(BaseHTTPRequestHandler):
         if not f.exists():
             return self._json(dict(error=f"missing {f.name}"), 404)
         ctype = mimetypes.guess_type(str(f))[0] or "application/octet-stream"
-        if f.suffix == ".js":
+        if f.suffix in (".js", ".mjs"):
             ctype = "text/javascript"
+        if f.suffix == ".wasm":
+            ctype = "application/wasm"
         if f.suffix == ".glb":
             ctype = "model/gltf-binary"
         self._send(200, f.read_bytes(), ctype, cache="/vendor/" in f.as_posix())

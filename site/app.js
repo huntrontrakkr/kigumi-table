@@ -1,7 +1,8 @@
 // kigumi table — browser configurator.  Everything about parameters comes from
-// /api/schema; this file only knows the API shapes.  In this build the API is
-// answered by the engine running in the page (engine/: Python in WebAssembly,
-// Manifold, WebGPU) instead of a server.
+// /api/schema; this file only knows the API shapes.  Two back ends answer them:
+// the kigumi server when it serves this page (python -m kigumi.server: native
+// Python, Blender photos, STEP and Rhino export), otherwise the engine running
+// in the page (engine/: Python in WebAssembly, Manifold, WebGPU) -- GitHub Pages.
 
 import { Viewer } from './viewer.js';
 import { swatch } from './materials.js';
@@ -40,14 +41,53 @@ const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej;
 ready.catch(() => {});
 
 // ---------------------------------------------------------------- API
+const backend = { server: false };
+
+// the kigumi server marks the page it serves (<meta name="kigumi-server">)
+async function detectServer() {
+  if (!document.querySelector('meta[name="kigumi-server"]')) return false;
+  backend.server = await serverApi('/api/schema');
+  return true;
+}
+
 async function api(path, body) {
-  if (path === '/api/render') return renderLocally(body);
+  if (path === '/api/render') {
+    if (backend.server) {
+      try { return await serverApi(path, body); } catch (e) { console.warn('server photo failed; rendering in the page', e); }
+    }
+    return renderLocally(body);
+  }
+  if (backend.server) return serverApi(path, body);
   try {
     return await engine.api(path, body);
   } catch (e) {
     if (!e.trace) e.trace = e.stack;
     throw e;
   }
+}
+
+async function serverApi(path, body) {
+  const opts = body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  };
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (e) {
+    const err = new Error('The kigumi server is not answering (' + (e.message || 'network error') + ').');
+    err.network = true;
+    throw err;
+  }
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 400) || res.statusText }; }
+  if (!res.ok || (data && data.error)) {
+    const err = new Error((data && data.error) || res.statusText || ('HTTP ' + res.status));
+    err.trace = data && data.trace;
+    err.status = res.status;
+    throw err;
+  }
+  return data;
 }
 
 // Photo: a high-resolution render of the live scene on the GPU (see viewer.photo)
@@ -788,7 +828,8 @@ function showPhotoBox() {
   let content;
   if (photo.busy) {
     content = `<div class="lb-wait"><div class="spinner" aria-hidden="true"></div>
-      <p>Rendering on your GPU <span class="faint">· a few seconds ·</span> <span id="lb-elapsed" class="faint">${Math.round((performance.now() - photo.t0) / 1000)} s</span></p></div>
+      <p>${backend.server ? 'Rendering with Blender Cycles <span class="faint">· usually 10–30 s ·</span>'
+        : 'Rendering on your GPU <span class="faint">· a few seconds ·</span>'} <span id="lb-elapsed" class="faint">${Math.round((performance.now() - photo.t0) / 1000)} s</span></p></div>
       <div class="lb-foot">${chips}</div>`;
   } else if (photo.url) {
     const stale = photo.key !== paramsKey();
@@ -828,15 +869,17 @@ async function exportFiles() {
     const name = (f) => (typeof f === 'string' ? decodeURIComponent(f.split('/').pop()) : f.name);
     const ext = (f) => (name(f).match(/\.([a-z0-9]+)$/i) || [, ''])[1].toLowerCase();
     exporting.ok = true;
-    exporting.html = `<div class="lb-msg">
-      <p>The fabrication package is ready: DXF cut sheets for the strips and the glass, drawings, a cut list,
+    const what = res.folder
+      ? `${files.length} file${files.length === 1 ? '' : 's'} ready in <code>${esc(res.folder)}</code>.`
+      : `The fabrication package is ready: DXF cut sheets for the strips and the glass, drawings, a cut list,
       <code>FABRICATION.md</code>, and the model as GLB and STL. <span class="faint">(STEP and Rhino .3dm come from the
-      Python package on your own machine.)</span></p>
+      Python package on your own machine.)</span>`;
+    exporting.html = `<div class="lb-msg"><p>${what}</p>
       <ul class="files">${files.map((f) => `<li><span class="ext">${esc(ext(f))}</span><a href="${esc(url(f))}" download="${esc(name(f))}">${esc(name(f))}</a></li>`).join('')}</ul></div>`;
   } catch (e) {
     exporting.html = `<div class="lb-msg">
       <p>The export didn't finish.</p>
-      <p class="faint">The engine said: ${esc(e.message)}</p>
+      <p class="faint">${backend.server ? 'The server' : 'The engine'} said: ${esc(e.message)}</p>
       ${e.trace ? `<details><summary>details</summary><pre>${esc(e.trace)}</pre></details>` : ''}</div>`;
   } finally {
     clearInterval(timer);
@@ -850,7 +893,8 @@ async function exportFiles() {
 function showExportBox() {
   const html = exporting.busy
     ? `<div class="lb-wait"><div class="spinner" aria-hidden="true"></div>
-        <p>Writing fabrication files <span class="faint">· cut sheets, drawings, cut list · about a minute in the browser ·</span> <span id="lb-elapsed" class="faint">${Math.round((performance.now() - exporting.t0) / 1000)} s</span></p></div>`
+        <p>Writing fabrication files <span class="faint">· ${backend.server ? 'CAD, drawings, cut list · about 25 s'
+          : 'cut sheets, drawings, cut list · about a minute in the browser'} ·</span> <span id="lb-elapsed" class="faint">${Math.round((performance.now() - exporting.t0) / 1000)} s</span></p></div>`
     : exporting.html;
   openLightbox('Export', html, 'export');
 }
@@ -972,21 +1016,27 @@ async function main() {
 
   const bootText = $('#boot-text');
   const bootBar = $('#boot-bar');
-  const unsub = engine.onProgress((m) => {
-    if (bootText) bootText.textContent = m.text;
-    if (bootBar) bootBar.style.width = `${Math.round(100 * (m.frac || 0))}%`;
-  });
   let schema;
   try {
-    await engine.start();
-    unsub();
+    if (await detectServer()) {
+      schema = backend.server;
+      $('#btn-render').title = 'Photo-real render in Blender Cycles (10–30 s)';
+      $('#btn-export').title = 'Fabrication files: CAD (STEP, Rhino), DXF, drawings, cut list';
+    } else {
+      const unsub = engine.onProgress((m) => {
+        if (bootText) bootText.textContent = m.text;
+        if (bootBar) bootBar.style.width = `${Math.round(100 * (m.frac || 0))}%`;
+      });
+      await engine.start();
+      unsub();
+      schema = await api('/api/schema');
+    }
     $('#boot')?.classList.add('done');
     setTimeout(() => $('#boot')?.remove(), 600);
-    schema = await api('/api/schema');
   } catch (e) {
     document.documentElement.dataset.error = e.message;
     rejectReady(e);
-    showToast('Could not load the parameter schema: ' + e.message, 'error', e.trace);
+    showToast('Could not start the engine: ' + e.message, 'error', e.trace);
     return;
   }
   state.schema = (schema.params || []).filter((p) => p && p.name);
@@ -1013,6 +1063,7 @@ async function main() {
 window.kigumi = {
   ready,
   engine,
+  get backend() { return backend.server ? 'server' : 'page'; },
   settled,
   get params() { return { ...state.params }; },
   get report() { return state.report; },

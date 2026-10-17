@@ -62,7 +62,7 @@ solver.
 ## Run locally (Python)
 
 ```bash
-uv run python -m kigumi.server            # configurator at http://localhost:8765
+uv run python -m kigumi.server            # the same page at http://localhost:8765, on native Python
 uv run python scripts/render_one.py temple-round hero top     # Blender Cycles renders
 uv run python scripts/sheet.py out/sheet.png hero '{}' '{"leg_count":3}'   # side-by-side variants
 uv run python scripts/plan.py out/plan.png '{}' '{"leg_count":1}'          # plan diagnostics (fast)
@@ -71,6 +71,10 @@ uv run python scripts/organic.py out/organic 4                    # asymmetric o
 uv run python scripts/gallery.py out/gallery.png 6               # search + render 12 sound designs
 uv run python scripts/sweep.py 40                                 # robustness: build + check many
 ```
+
+Served by `kigumi.server`, the page uses the server instead of starting the in-page engine: builds
+run natively, **Render photo** uses Blender Cycles when Blender is installed, and the export adds STEP
+and Rhino `.3dm`.
 
 Python: `from kigumi.params import Params; from kigumi.build import build; d = build(Params(leg_count=3))`,
 then `kigumi.fab.export_all(d, "out/export/mine")` for the fabrication package.

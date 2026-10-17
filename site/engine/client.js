@@ -2,29 +2,34 @@
 // the kigumi package in Pyodide.  api(path, body) answers the same requests the
 // local Python server does, so the configurator code stays as it was.
 
-const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-let seq = 0;
+let worker = null;                  // started on first use, so a page served by
+let seq = 0;                        // the kigumi server never loads the engine
 const pending = new Map();
 const listeners = new Set();
 let lastProgress = { text: 'Starting…', frac: 0 };
 
-worker.onmessage = (ev) => {
-  const m = ev.data;
-  if (m && m.type === 'progress') {
-    lastProgress = m;
-    for (const f of listeners) f(m);
-    return;
-  }
-  const p = pending.get(m.id);
-  if (!p) return;
-  pending.delete(m.id);
-  if (m.ok) p.resolve(m.result);
-  else p.reject(Object.assign(new Error(shortError(m.error)), { trace: m.error }));
-};
-worker.onerror = (e) => {
-  for (const [, p] of pending) p.reject(new Error('The engine stopped: ' + (e.message || 'worker error')));
-  pending.clear();
-};
+function getWorker() {
+  if (worker) return worker;
+  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m && m.type === 'progress') {
+      lastProgress = m;
+      for (const f of listeners) f(m);
+      return;
+    }
+    const p = pending.get(m.id);
+    if (!p) return;
+    pending.delete(m.id);
+    if (m.ok) p.resolve(m.result);
+    else p.reject(Object.assign(new Error(shortError(m.error)), { trace: m.error }));
+  };
+  worker.onerror = (e) => {
+    for (const [, p] of pending) p.reject(new Error('The engine stopped: ' + (e.message || 'worker error')));
+    pending.clear();
+  };
+  return worker;
+}
 
 function shortError(s) {
   const lines = String(s || '').trim().split('\n');
@@ -35,7 +40,7 @@ function call(op, args) {
   const id = ++seq;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    worker.postMessage({ id, op, args });
+    getWorker().postMessage({ id, op, args });
   });
 }
 
