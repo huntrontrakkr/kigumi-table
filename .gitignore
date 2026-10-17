@@ -22,3 +22,6 @@ tools/ui-test/shots/
 # the web build packs the Python sources here (CI does it for Pages)
 site/py/
 .DS_Store
+
+# exported test systems (large; see tools/gpu-test/convert.py)
+tools/gpu-test/matrices/

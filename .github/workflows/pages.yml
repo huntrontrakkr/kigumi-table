@@ -20,14 +20,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - uses: actions/checkout@v7
       - name: Pack the Python package for the browser
-        run: python scripts/build_site.py
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+        run: python3 scripts/build_site.py
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
   deploy:
@@ -38,4 +35,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
