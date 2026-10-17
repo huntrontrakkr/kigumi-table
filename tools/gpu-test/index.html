@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebGPU sparse SPD solver: tests</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  #status { margin: 8px 0 16px; color: #555; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid #e3e3e3; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  td.pass { color: #1a7f37; font-weight: 600; }
+  td.fail { color: #c62828; font-weight: 600; }
+  td.info { color: #777; }
+  pre { background: #f6f6f6; padding: 10px; max-height: 320px; overflow: auto; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>WebGPU sparse SPD solver (site/engine/gpu/sparse.js)</h1>
+<div id="status">running…</div>
+<table>
+  <thead><tr>
+    <th>case</th><th>n</th><th>nnz</th><th>k</th><th>precond</th><th>iters</th><th>refinements</th>
+    <th>max relres</th><th>max rel. error</th><th>f64 floor</th><th>setup ms</th><th>total ms</th><th>result</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<pre id="log"></pre>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
