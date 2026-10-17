@@ -61,10 +61,10 @@ export function buildBVH(pos) {
 
   // scratch
   const binCnt = new Uint32Array(3 * BINS);
-  const binBox = new Float32Array(3 * BINS * 6);
+  const binBox = new Float64Array(3 * BINS * 6);
   const rArea = new Float64Array(BINS);
   const rCnt = new Uint32Array(BINS);
-  const rBox = new Float32Array(BINS * 6);
+  const rBox = new Float64Array(BINS * 6);
   const lb = new Float32Array(6), rb = new Float32Array(6);
   const ext = new Float64Array(3), cmin = new Float64Array(3), sc = new Float64Array(3);
   const stack = [0];
@@ -90,13 +90,18 @@ export function buildBVH(pos) {
     const pArea = area(nBox[6 * ni], nBox[6 * ni + 1], nBox[6 * ni + 2], nBox[6 * ni + 3], nBox[6 * ni + 4], nBox[6 * ni + 5]);
 
     let bestAxis = -1, bestBin = 0, bestCost = Infinity;
+    // small nodes get fewer bins: resetting and sweeping bins is per-node work
+    const nb = n < BINS ? Math.max(4, n) : BINS;
     if (Math.max(ext[0], ext[1], ext[2]) > 1e-12) {
-      binCnt.fill(0);
-      for (let o = 0; o < 6 * 3 * BINS; o += 6) {
-        binBox[o] = binBox[o + 1] = binBox[o + 2] = Infinity;
-        binBox[o + 3] = binBox[o + 4] = binBox[o + 5] = -Infinity;
+      for (let a = 0; a < 3; a++) {
+        for (let j = 0; j < nb; j++) {
+          const b = a * BINS + j, o = 6 * b;
+          binCnt[b] = 0;
+          binBox[o] = binBox[o + 1] = binBox[o + 2] = Infinity;
+          binBox[o + 3] = binBox[o + 4] = binBox[o + 5] = -Infinity;
+        }
       }
-      for (let a = 0; a < 3; a++) sc[a] = ext[a] > 1e-12 ? (BINS * (1 - 1e-6)) / ext[a] : 0;
+      for (let a = 0; a < 3; a++) sc[a] = ext[a] > 1e-12 ? (nb * (1 - 1e-6)) / ext[a] : 0;
       for (let k = s; k < e; k++) {
         const t = idx[k];
         const ci = 3 * t, bi = 6 * t;
@@ -104,7 +109,7 @@ export function buildBVH(pos) {
         for (let a = 0; a < 3; a++) {
           if (sc[a] === 0) continue;
           let q = ((cen[ci + a] - cmin[a]) * sc[a]) | 0;
-          if (q > BINS - 1) q = BINS - 1;
+          if (q > nb - 1) q = nb - 1;
           const b = a * BINS + q;
           binCnt[b]++;
           const o = 6 * b;
@@ -120,7 +125,7 @@ export function buildBVH(pos) {
         if (sc[a] === 0) continue;
         // sweep from the right: area and count of bins [j, BINS)
         let X0 = Infinity, Y0 = Infinity, Z0 = Infinity, X1 = -Infinity, Y1 = -Infinity, Z1 = -Infinity, cnt = 0;
-        for (let j = BINS - 1; j > 0; j--) {
+        for (let j = nb - 1; j > 0; j--) {
           const o = 6 * (a * BINS + j);
           cnt += binCnt[a * BINS + j];
           if (binBox[o] < X0) X0 = binBox[o];
@@ -136,7 +141,7 @@ export function buildBVH(pos) {
         }
         // sweep from the left and evaluate each split plane
         X0 = Infinity; Y0 = Infinity; Z0 = Infinity; X1 = -Infinity; Y1 = -Infinity; Z1 = -Infinity; cnt = 0;
-        for (let j = 1; j < BINS; j++) {
+        for (let j = 1; j < nb; j++) {
           const o = 6 * (a * BINS + j - 1);
           cnt += binCnt[a * BINS + j - 1];
           if (binBox[o] < X0) X0 = binBox[o];
@@ -166,7 +171,7 @@ export function buildBVH(pos) {
       let i = s, j = e - 1;
       while (i <= j) {
         let q = ((cen[3 * idx[i] + a] - cm) * sa) | 0;
-        if (q > BINS - 1) q = BINS - 1;
+        if (q > nb - 1) q = nb - 1;
         if (q < bestBin) i++;
         else { const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp; j--; }
       }
@@ -199,10 +204,9 @@ export function buildBVH(pos) {
   };
   let next = 0;
   if (nLeft[0] < 0) {
-    // the root is a leaf: one interior node holding it next to an empty box
+    // the root is a leaf: one interior node holding it next to an empty slot
     slot(0, 0);
-    out[8] = out[9] = out[10] = Infinity;
-    out[12] = out[13] = out[14] = -Infinity;
+    emptySlot(out, outU, 8);
     next = 1;
   } else {
     const st = [0, -1];               // pairs: build node, parent slot to patch
@@ -219,6 +223,16 @@ export function buildBVH(pos) {
   }
   return { nodes: out.subarray(0, next * 16), order: idx, nodeCount: next, leafCount: leaves, depth: maxDepth,
     bounds: [rx0, ry0, rz0, rx1, ry1, rz1], ms: now() - t0 };
+}
+
+// A child slot no ray reaches: a point box 1.7e30 away, beyond any ray's range (an
+// inverted box would pass the min/max slab test), flagged as a one-triangle leaf so
+// that even a hit could not recurse.
+export function emptySlot(f32, u32, dst) {
+  f32[dst] = f32[dst + 1] = f32[dst + 2] = -1e30;
+  f32[dst + 4] = f32[dst + 5] = f32[dst + 6] = -1e30;
+  u32[dst + 3] = 0;
+  u32[dst + 7] = 1;
 }
 
 function boxOf(idx, bb, s, e, outBox) {

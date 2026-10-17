@@ -11,7 +11,7 @@
 // like the live view.  Khronos PBR Neutral tone mapping, sRGB, PNG out.
 // Resolves to null when WebGPU is unavailable.
 
-import { buildBVH } from './bvh.js';
+import { buildBVH, emptySlot } from './bvh.js';
 import { extractScene } from './scene.js';
 import { traceWGSL, resolveWGSL, PARAMS_BYTES } from './kernel.js';
 
@@ -381,9 +381,9 @@ function inverseNeutral(target, exposure) {
 function align(n, a) { return Math.ceil(n / a) * a; }
 
 function emptyNodes() {
-  const f = new Float32Array(16);
-  f.set([Infinity, Infinity, Infinity], 0); f.set([-Infinity, -Infinity, -Infinity], 4);
-  f.set([Infinity, Infinity, Infinity], 8); f.set([-Infinity, -Infinity, -Infinity], 12);
+  const f = new Float32Array(16), u = new Uint32Array(f.buffer);
+  emptySlot(f, u, 0);
+  emptySlot(f, u, 8);
   return f;
 }
 
