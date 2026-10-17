@@ -87,6 +87,10 @@ export function jacobiScale(n, indptr, indices, data) {
  * g^T A[P,P] g = 1.  Uses the lower triangle of A only (so a slightly
  * unsymmetric input is read as its lower triangle).
  *
+ * Nested patterns are cheap: when P_{i} = P_{i-1} + {i} (consecutive degrees of
+ * freedom of one node have the same neighbours), the Cholesky factor of row
+ * i-1 is extended by one row (O(m^2)) instead of being recomputed (O(m^3)).
+ *
  * Returns { ptr, idx, val (Float64Array), fails } -- rows whose local
  * Cholesky broke down (not SPD in floating point) fall back to a Jacobi row.
  */
@@ -100,71 +104,108 @@ export function fsai(n, indptr, indices, vals, level = 1) {
   const tmp = [];
   for (let i = 0; i < n; i++) {
     tmp.length = 0;
-    const add = (j) => { if (j <= i && mark[j] !== i) { mark[j] = i; tmp.push(j); } };
-    add(i);
+    mark[i] = i;
+    tmp.push(i);
     for (let p = indptr[i]; p < indptr[i + 1]; p++) {
       const j = indices[p];
-      add(j);
-      if (level >= 2) for (let q = indptr[j]; q < indptr[j + 1]; q++) add(indices[q]);
+      if (j <= i && mark[j] !== i) { mark[j] = i; tmp.push(j); }
+      if (level >= 2) {
+        for (let q = indptr[j]; q < indptr[j + 1]; q++) {
+          const l = indices[q];
+          if (l <= i && mark[l] !== i) { mark[l] = i; tmp.push(l); }
+        }
+      }
     }
     const P = Int32Array.from(tmp).sort();
     rowPat[i] = P;
     total += P.length;
     if (P.length > mmax) mmax = P.length;
   }
+  const S = mmax;                                 // row stride of the dense factor
   const ptr = new Int32Array(n + 1);
   const idx = new Int32Array(total);
   const val = new Float64Array(total);
-  const L = new Float64Array(mmax * mmax);
-  const h = new Float64Array(mmax);
+  const L = new Float64Array(S * S);
+  const h = new Float64Array(S);
   let fails = 0;
   let o = 0;
+  let prev = null;                                // pattern whose factor L holds (null: none)
   for (let i = 0; i < n; i++) {
     const P = rowPat[i];
-    const m = P.length;                          // P is sorted, so P[m-1] === i
-    for (let a = 0; a < m; a++) pos[P[a]] = a;
-    // dense lower triangle of A[P, P] (row-major m x m in L)
-    for (let a = 0; a < m; a++) {
-      const ra = a * m;
-      for (let b = 0; b <= a; b++) L[ra + b] = 0;
-      const r = P[a];
-      for (let p = indptr[r]; p < indptr[r + 1]; p++) {
-        const b = pos[indices[p]];
-        if (b >= 0 && b <= a) L[ra + b] += vals[p];
-      }
-    }
-    for (let a = 0; a < m; a++) pos[P[a]] = -1;
-    // in-place Cholesky, row by row
+    const m = P.length;                           // P is sorted, so P[m-1] === i
     let ok = true;
-    for (let a = 0; a < m && ok; a++) {
-      const ra = a * m;
-      for (let b = 0; b <= a; b++) {
-        const rb = b * m;
-        let sum = L[ra + b];
-        for (let c = 0; c < b; c++) sum -= L[ra + c] * L[rb + c];
-        if (a === b) {
-          if (!(sum > 0)) { ok = false; break; }
-          L[ra + a] = Math.sqrt(sum);
-        } else {
-          L[ra + b] = sum / L[rb + b];
+    let nested = prev !== null && prev.length === m - 1;
+    for (let a = 0; nested && a < m - 1; a++) if (P[a] !== prev[a]) nested = false;
+    if (nested) {
+      // bordered factor: new last row l = L^{-1} A[P', i], l_mm = sqrt(a_ii - l.l)
+      const r = (m - 1) * S;
+      for (let b = 0; b < m; b++) L[r + b] = 0;
+      for (let a = 0; a < m - 1; a++) pos[P[a]] = a;
+      pos[i] = m - 1;
+      let dii = 0;
+      for (let p = indptr[i]; p < indptr[i + 1]; p++) {
+        const b = pos[indices[p]];
+        if (b >= 0 && b < m - 1) L[r + b] += vals[p];
+        else if (b === m - 1) dii += vals[p];
+      }
+      for (let a = 0; a < m; a++) pos[P[a]] = -1;
+      let ss = 0;
+      for (let b = 0; b < m - 1; b++) {
+        const rb = b * S;
+        let sum = L[r + b];
+        for (let c = 0; c < b; c++) sum -= L[r + c] * L[rb + c];
+        const v = sum / L[rb + b];
+        L[r + b] = v;
+        ss += v * v;
+      }
+      const d = dii - ss;
+      if (d > 0) L[r + m - 1] = Math.sqrt(d);
+      else ok = false;
+    } else {
+      // dense lower triangle of A[P, P], then in-place Cholesky row by row
+      for (let a = 0; a < m; a++) pos[P[a]] = a;
+      for (let a = 0; a < m; a++) {
+        const ra = a * S;
+        for (let b = 0; b <= a; b++) L[ra + b] = 0;
+        const r = P[a];
+        for (let p = indptr[r]; p < indptr[r + 1]; p++) {
+          const b = pos[indices[p]];
+          if (b >= 0 && b <= a) L[ra + b] += vals[p];
+        }
+      }
+      for (let a = 0; a < m; a++) pos[P[a]] = -1;
+      for (let a = 0; a < m && ok; a++) {
+        const ra = a * S;
+        for (let b = 0; b <= a; b++) {
+          const rb = b * S;
+          let sum = L[ra + b];
+          for (let c = 0; c < b; c++) sum -= L[ra + c] * L[rb + c];
+          if (a === b) {
+            if (!(sum > 0)) { ok = false; break; }
+            L[ra + a] = Math.sqrt(sum);
+          } else {
+            L[ra + b] = sum / L[rb + b];
+          }
         }
       }
     }
     ptr[i] = o;
     if (ok) {
       // h = L^{-T} e_last  (back substitution with L^T)
-      h[m - 1] = 1 / L[(m - 1) * m + (m - 1)];
+      h[m - 1] = 1 / L[(m - 1) * S + (m - 1)];
       for (let a = m - 2; a >= 0; a--) {
         let sum = 0;
-        for (let b = a + 1; b < m; b++) sum += L[b * m + a] * h[b];
-        h[a] = -sum / L[a * m + a];
+        for (let b = a + 1; b < m; b++) sum += L[b * S + a] * h[b];
+        h[a] = -sum / L[a * S + a];
       }
       for (let a = 0; a < m; a++) { idx[o] = P[a]; val[o] = h[a]; o++; }
+      prev = P;
     } else {
       fails++;
       let dii = 0;
       for (let p = indptr[i]; p < indptr[i + 1]; p++) if (indices[p] === i) dii += vals[p];
       idx[o] = i; val[o] = dii > 0 ? 1 / Math.sqrt(dii) : 1; o++;
+      prev = null;
     }
   }
   ptr[n] = o;

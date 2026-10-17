@@ -10,8 +10,9 @@
 //
 // Method (mixed-precision iterative refinement):
 //   * symmetric Jacobi scaling  As = S A S,  S = diag(1/sqrt(a_ii));
-//   * an FSAI preconditioner G (lower triangular, G As G^T ~ I), set up once
-//     per matrix on the CPU in float64 (cheap: one small dense Cholesky per row);
+//   * an FSAI preconditioner G (lower triangular, G As G^T ~ I, on the pattern
+//     of tril(As^2)), set up once per matrix on the CPU in float64 (one small
+//     dense Cholesky per row, bordered for consecutive dofs of a node);
 //   * outer loop on the CPU in float64:  r = b - A x;  d = inner(S r);  x += S d;
 //     until ||b - A x|| / ||b|| <= tol for every column, or no more progress;
 //   * inner solve on the GPU in float32: batched preconditioned CG on As over
@@ -32,7 +33,8 @@ const now = () => (typeof performance !== 'undefined' ? performance.now() : Date
 export const DEFAULTS = Object.freeze({
   eta: 1e-4,          // inner float32 PCG: relative residual target per refinement
   maxRefine: 15,      // cap on outer (float64) refinements
-  precond: 'fsai',    // 'fsai' (pattern of tril(A)), 'fsai2' (tril(A^2): fewer, dearer iterations), 'jacobi'
+  precond: 'fsai2',   // 'fsai2' (FSAI on the pattern of tril(A^2)), 'fsai' (tril(A): cheaper set-up,
+                      //   ~2x the iterations), 'jacobi' (plain CG on the scaled system)
   checkEvery: 32,     // longest stretch of GPU iterations between read-backs
   minGain: 0.5,       // a column stops after `patience` refinements without cutting its
   patience: 2,        //   residual by this factor

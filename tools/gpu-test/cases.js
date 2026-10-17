@@ -4,7 +4,7 @@
 //
 // URL parameters (forwarded by index.html):
 //   cases=a,b,...   subset of case ids (default: all of the default plan)
-//   compare=1       also run plate_four / grillage_four with the jacobi and fsai2 preconditioners
+//   compare=1       also run plate_four / grillage_four with the jacobi and fsai (level 1) preconditioners
 //   bigk=K          right-hand sides of plate_big to solve (default: all 90)
 //   eta, precond, checkEvery, maxIter, tol    forwarded to solveSPD
 
@@ -102,7 +102,7 @@ function plan(params, manifest) {
   if (params.compare) {
     for (const name of ['plate_four', 'grillage_four']) {
       if (!meta[name]) continue;
-      for (const precond of ['jacobi', 'fsai2']) {
+      for (const precond of ['jacobi', 'fsai']) {
         items.push({ id: `${name}_${precond}`, group: 'compare', accept: ACCEPT, precond, make: () => exported(name) });
       }
     }
