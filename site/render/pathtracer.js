@@ -15,7 +15,7 @@
 // a time budget (budgetMs) after which it stops and delivers the samples so far;
 // triangle and memory caps beyond which it resolves to null.
 
-import { buildBVH, emptySlot } from './bvh.js';
+import { buildScene } from './build.js';
 import { extractScene, countTriangles, MAT_VEC4, XF_VEC4 } from './scene.js';
 import { traceWGSL, resolveWGSL, PARAMS_BYTES } from './kernel.js';
 
@@ -75,6 +75,15 @@ export function renderPhoto(opts = {}) {
   return run;
 }
 
+// Optional: create the device and compile the pipelines ahead of the first render
+// (shader compilation can take seconds on phones).  Resolves true when WebGPU is
+// usable.  `viewer` is only used to borrow three.js's device if ours fails.
+export async function preparePathTracer(viewer) {
+  const g = await getGPU(viewer);
+  if (!g) return false;
+  try { await g.pipelines; getWorker(); return true; } catch (e) { return false; }
+}
+
 // Release the GPU device and pipelines (they are kept between renders).
 export async function disposePathTracer() {
   const g = await (gpuPromise || Promise.resolve(null));
@@ -105,36 +114,19 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
   if (pixels * 16 > maxBinding) return fail('image too large for this GPU', { pixels });
 
   const cam = cameraFor(viewer, view, width / height);
-  const sc = extractScene(viewer.model);
-  const bvh = buildBVH(sc.pos);
-  const T1 = performance.now();
   const lights = lighting(viewer, studio);
-
-  // ---- scene buffers: BVH nodes, and the geometry buffer (see kernel.js)
-  const N = sc.count;
-  const nT = Math.max(1, N);
-  const offShade = 3 * nT, offMats = 4 * nT, offXf = offMats + sc.nMats * MAT_VEC4;
-  const geoVec4 = offXf + Math.max(1, sc.nMeshes) * XF_VEC4;
-  const nodes = N ? bvh.nodes : emptyNodes();
-  if (geoVec4 * 16 > maxBinding || nodes.byteLength > maxBinding) {
-    return fail('scene too large for this GPU', { triangles: N, bytes: geoVec4 * 16 + nodes.byteLength, maxBinding });
+  const sc = extractScene(viewer.model);
+  const N = sc.count, nMeshes = sc.nMeshes, nMats = sc.nMats, extractMs = sc.ms;
+  // the GPU buffers' sizes are known before building: refuse what will not fit
+  const geoBytes = 16 * (4 * Math.max(1, N) + nMats * MAT_VEC4 + Math.max(1, nMeshes) * XF_VEC4);
+  if (geoBytes > maxBinding || 64 * Math.max(1, N) > maxBinding) {
+    return fail('scene too large for this GPU', { triangles: N, bytes: geoBytes, maxBinding });
   }
-  const geo = new Uint32Array(geoVec4 * 4);
-  const geoF = new Float32Array(geo.buffer);
-  const ord = bvh.order, P = sc.pos, Nr = sc.nrm, ids = sc.ids;
-  for (let k = 0; k < N; k++) {
-    const s = ord[k], o = 9 * s, b = 12 * k, h = 4 * (offShade + k);
-    geoF[b] = P[o]; geoF[b + 1] = P[o + 1]; geoF[b + 2] = P[o + 2];
-    geoF[b + 4] = P[o + 3] - P[o]; geoF[b + 5] = P[o + 4] - P[o + 1]; geoF[b + 6] = P[o + 5] - P[o + 2];
-    geoF[b + 8] = P[o + 6] - P[o]; geoF[b + 9] = P[o + 7] - P[o + 1]; geoF[b + 10] = P[o + 8] - P[o + 2];
-    geo[b + 3] = ids[s] & 0xffff;
-    geo[h] = oct(Nr[o], Nr[o + 1], Nr[o + 2]);
-    geo[h + 1] = oct(Nr[o + 3], Nr[o + 4], Nr[o + 5]);
-    geo[h + 2] = oct(Nr[o + 6], Nr[o + 7], Nr[o + 8]);
-    geo[h + 3] = ids[s];
-  }
-  geoF.set(sc.mats, 4 * offMats);
-  geoF.set(sc.xforms.subarray(0, sc.nMeshes * XF_VEC4 * 4), 4 * offXf);
+  // BVH and packing off the main thread (a second or more for big scenes on phones)
+  const built = await buildOffThread(sc);
+  const { nodes, geo, offShade, offMats, offXf } = built;
+  const T1 = performance.now();
+  if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
 
   const bufs = [];
   const lost = { flag: false };
@@ -286,8 +278,9 @@ async function render({ viewer, view = 'hero', width = DEFAULTS.width, height = 
     const blob = await encodePNG(rgba, width, height);
     const T4 = performance.now();
     lastStats = {
-      triangles: N, meshes: sc.nMeshes, materials: sc.nMats, bvhNodes: bvh.nodeCount, bvhDepth: bvh.depth,
-      extractMs: Math.round(sc.ms), bvhMs: Math.round(bvh.ms), setupMs: Math.round(T2 - T1), traceMs: Math.round(traceMs),
+      triangles: N, meshes: nMeshes, materials: nMats, bvhNodes: built.nodeCount, bvhDepth: built.depth, worker: built.worker,
+      extractMs: Math.round(extractMs), bvhMs: Math.round(built.bvhMs), packMs: Math.round(built.packMs), buildMs: Math.round(T1 - T0),
+      setupMs: Math.round(T2 - T1), traceMs: Math.round(traceMs),
       outputMs: Math.round(T4 - T3), totalMs: Math.round(T4 - T0), samples: spp, requested: samples, stopped,
       width, height, dispatches, maxDispatchMs: Math.round(maxDispatchMs), slowest, msPerSample: +(traceMs / Math.max(spp, 1)).toFixed(2),
       gpuBytes: nodes.byteLength + geo.byteLength + pixels * 24, adapter: gpu.info, limits: gpu.requested, mobile: MOBILE,
@@ -363,6 +356,45 @@ function isMobile() {
   if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') return navigator.userAgentData.mobile;
   const ua = navigator.userAgent || '';
   return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+}
+
+// --------------------------------------------------------------------------- worker
+// A module worker made from a blob (same origin as the page wherever this module
+// is served from) that imports build.js; checked with a ping before any data is
+// transferred to it, so a failure falls back on building here.
+let workerPromise = null;
+function getWorker() {
+  if (workerPromise) return workerPromise;
+  workerPromise = new Promise((resolve) => {
+    try {
+      const src = `import { buildScene } from ${JSON.stringify(new URL('./build.js', import.meta.url).href)};
+self.onmessage = (e) => {
+  if (e.data === 'ping') { self.postMessage('pong'); return; }
+  try { const r = buildScene(e.data); self.postMessage({ ok: true, r }, [r.nodes.buffer, r.geo.buffer]); }
+  catch (err) { self.postMessage({ ok: false, error: String((err && err.stack) || err) }); }
+};`;
+      const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      const w = new Worker(url, { type: 'module' });
+      const timer = setTimeout(() => { w.terminate(); resolve(null); }, 10000);
+      w.onmessage = (e) => { if (e.data === 'pong') { clearTimeout(timer); w.onmessage = null; w.onerror = null; resolve(w); } };
+      w.onerror = (e) => { e.preventDefault?.(); clearTimeout(timer); w.terminate(); resolve(null); };
+      w.postMessage('ping');
+    } catch (e) {
+      resolve(null);
+    }
+  });
+  return workerPromise;
+}
+
+async function buildOffThread(sc) {
+  const w = await getWorker();
+  if (!w) return { ...buildScene(sc), worker: false };
+  return new Promise((resolve, reject) => {
+    w.onmessage = (e) => { w.onmessage = w.onerror = null; if (e.data.ok) resolve({ ...e.data.r, worker: true }); else reject(new Error(e.data.error)); };
+    w.onerror = (e) => { e.preventDefault?.(); workerPromise = null; w.terminate(); reject(new Error('path tracer: BVH worker failed')); };
+    const msg = { pos: sc.pos, nrm: sc.nrm, ids: sc.ids, mats: sc.mats, xforms: sc.xforms, nMats: sc.nMats, nMeshes: sc.nMeshes };
+    w.postMessage(msg, [sc.pos.buffer, sc.nrm.buffer, sc.ids.buffer]);
+  });
 }
 
 // --------------------------------------------------------------------------- camera
@@ -467,26 +499,6 @@ function inverseNeutral(target, exposure) {
 // --------------------------------------------------------------------------- helpers
 function align(n, a) { return Math.ceil(n / a) * a; }
 function gcd(a, b) { while (b) { [a, b] = [b, a % b]; } return a; }
-
-function emptyNodes() {
-  const f = new Float32Array(16), u = new Uint32Array(f.buffer);
-  emptySlot(f, u, 0);
-  emptySlot(f, u, 8);
-  return f;
-}
-
-// octahedral unit vector as two snorm16
-function oct(x, y, z) {
-  const l = Math.abs(x) + Math.abs(y) + Math.abs(z) || 1;
-  let u = x / l, v = y / l;
-  if (z < 0) {
-    const ou = u;
-    u = (1 - Math.abs(v)) * (ou >= 0 ? 1 : -1);
-    v = (1 - Math.abs(ou)) * (v >= 0 ? 1 : -1);
-  }
-  const q = (a) => Math.round(Math.max(-1, Math.min(1, a)) * 32767) & 0xffff;
-  return (q(u) | (q(v) << 16)) >>> 0;
-}
 
 async function encodePNG(rgba, w, h) {
   const img = new ImageData(rgba, w, h);
