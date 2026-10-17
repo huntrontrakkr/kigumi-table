@@ -24,7 +24,7 @@ def _pool():
     return _POOL
 
 
-def evaluate(args) -> dict:
+def evaluate(args, keep_design: bool = False) -> dict:
     seed, base, keep, jitter = args
     from .build import build
     from .checks import run_checks
@@ -40,16 +40,34 @@ def evaluate(args) -> dict:
     warns = sum(1 for c in checks if c["status"] == "warn")
     n_beams = len(d.layout.beams)
     score = -100.0 * fails - 10.0 * warns + 20.0 * cov + (0 if n_beams >= 12 else -50)
-    return dict(seed=seed, params=p.to_dict(), score=score, fails=fails, warns=warns, coverage=cov,
-                checks=checks)
+    out = dict(seed=seed, params=p.to_dict(), score=score, fails=fails, warns=warns, coverage=cov,
+               checks=checks)
+    if keep_design:
+        out["design"] = d
+    return out
 
 
 def best_of(seed0: int, n: int = 12, base: dict | None = None, keep: list | None = None,
-            jitter: float = 0.0) -> list[dict]:
+            jitter: float = 0.0, budget_s: float | None = None) -> list[dict]:
+    """n candidates, best first.  Without worker processes (the browser) they
+    run one by one, and with a time budget the search stops once it is spent
+    and some candidate built; the winner then keeps its built design
+    (["design"]) so it need not be built again."""
     jobs = [(seed0 + 7919 * i, base, keep, jitter) for i in range(n)]
     try:
         res = list(_pool().map(evaluate, jobs))
     except (ImportError, NotImplementedError, OSError, RuntimeError):
-        res = [evaluate(j) for j in jobs]          # no processes (e.g. the browser): one by one
+        import time
+        t0, res = time.monotonic(), []
+        for j in jobs:
+            r = evaluate(j, keep_design=True)
+            if res and r["score"] <= max(q["score"] for q in res):
+                r.pop("design", None)                   # only the best so far keeps its design
+            else:
+                for q in res:
+                    q.pop("design", None)
+            res.append(r)
+            if budget_s is not None and time.monotonic() - t0 > budget_s and any(q["score"] > -1e9 for q in res):
+                break
     res.sort(key=lambda r: r["score"], reverse=True)
     return res

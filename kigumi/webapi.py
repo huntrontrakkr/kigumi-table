@@ -26,13 +26,14 @@ def schema() -> str:
     return json.dumps(dict(params=_schema(), presets={k: preset(k).to_dict() for k in PRESETS}), default=float)
 
 
-def _entry(p: Params) -> dict:
+def _entry(p: Params, d=None) -> dict:
     k = _key(p)
     if k in _cache:
         _cache.move_to_end(k)
         return _cache[k]
     t = time.perf_counter()
-    d = _build(p)
+    if d is None:
+        d = _build(p)
     rep = summarize(d)
     rep["checks"] = []
     rep["checks_url"] = f"/api/checks/{k}"
@@ -74,9 +75,12 @@ def random(body_json: str) -> tuple[str, bytes]:
     from .search import best_of
     body = json.loads(body_json)
     seed = int(body.get("seed", _r.randrange(10_000_000)))
-    n = int(body.get("candidates", 4))
-    ranked = best_of(seed, n, body.get("base"), body.get("keep", []), float(body.get("jitter", 0.0)))
+    n = int(body.get("candidates", 6))
+    ranked = best_of(seed, n, body.get("base"), body.get("keep", []), float(body.get("jitter", 0.0)),
+                     budget_s=float(body.get("budget_s", 12.0)))
     top = ranked[0]
+    if "design" in top:
+        _entry(Params.from_dict(top["params"]), top.pop("design"))     # built already
     pub, glb = build(json.dumps(dict(params=top["params"])))
     out = json.loads(pub)
     out["search"] = [dict(seed=r["seed"], score=round(r["score"], 1), fails=r.get("fails"), warns=r.get("warns"))
