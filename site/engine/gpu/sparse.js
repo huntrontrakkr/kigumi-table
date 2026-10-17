@@ -535,21 +535,26 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     return '';
   };
   for (let j = 0; j < m; j++) if ((why[j] = rel[j] <= tol ? 'tol' : '')) done[j] = 1;
+  const ac = new Int32Array(m);                 // active columns (row-major loops below)
+  const inv = new Float64Array(m);
+  const imp = new Uint8Array(m);
   for (let ref = 0; ref < opt.maxRefine; ref++) {
-    const act = [];
-    for (let j = 0; j < m; j++) if (!done[j]) act.push(j);
-    if (!act.length) break;
+    let na = 0;
+    for (let j = 0; j < m; j++) if (!done[j]) ac[na++] = j;
+    if (!na) break;
+    const act = Array.from(ac.subarray(0, na));
     // scaled residuals, each column normalised to unit length (float32-safe)
     tc = now();
     rs.fill(0);
-    for (const j of act) {
-      let ss = 0;
-      for (let i = 0; i < n; i++) { const t = s[i] * r[i * m + j]; ss += t * t; }
-      nu[j] = Math.sqrt(ss);
-    }
+    nu.fill(0);
     for (let i = 0; i < n; i++) {
-      const si = s[i];
-      for (const j of act) if (nu[j] > 0) rs[i * kp + j] = (si * r[i * m + j]) / nu[j];
+      const si = s[i], o = i * m;
+      for (let a = 0; a < na; a++) { const j = ac[a]; const t = si * r[o + j]; nu[j] += t * t; }
+    }
+    for (let a = 0; a < na; a++) { const j = ac[a]; nu[j] = Math.sqrt(nu[j]); inv[j] = nu[j] > 0 ? 1 / nu[j] : 0; }
+    for (let i = 0; i < n; i++) {
+      const si = s[i], o = i * m, q = i * kp;
+      for (let a = 0; a < na; a++) { const j = ac[a]; rs[q + j] = si * r[o + j] * inv[j]; }
     }
     cpuMs += now() - tc;
     const tg = now();
@@ -569,27 +574,35 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     refinements++;
     // x += S d (columns with a non-finite correction are left alone and stop)
     tc = now();
-    for (const j of act) {
-      let ok = nu[j] > 0;
-      for (let i = 0; ok && i < n; i++) if (!Number.isFinite(inner.X[i * kp + j])) ok = false;
-      okCol[j] = ok ? 1 : 0;
-    }
+    const X = inner.X;
+    for (let a = 0; a < na; a++) { const j = ac[a]; okCol[j] = nu[j] > 0 ? 1 : 0; }
     for (let i = 0; i < n; i++) {
-      const si = s[i];
-      for (const j of act) if (okCol[j]) x[i * m + j] += nu[j] * si * inner.X[i * kp + j];
+      const q = i * kp;
+      for (let a = 0; a < na; a++) { const j = ac[a]; if (!Number.isFinite(X[q + j])) okCol[j] = 0; }
+    }
+    for (let a = 0; a < na; a++) { const j = ac[a]; inv[j] = okCol[j] ? nu[j] : 0; }   // scale, 0 = skip
+    for (let i = 0; i < n; i++) {
+      const si = s[i], o = i * m, q = i * kp;
+      for (let a = 0; a < na; a++) { const j = ac[a]; x[o + j] += inv[j] * si * X[q + j]; }
     }
     // the float64 floor depends on |x| only: evaluate it with the first refined x and at the end
     residualRowMajor(n, m, indptr, indices, data, x, b, r, ref === 0 ? floor : null);
     const relNew = relOf(colNormsRowMajor(n, m, r), bn);
-    for (const j of act) {
+    let anyImp = false;
+    for (let a = 0; a < na; a++) {
+      const j = ac[a];
       rel[j] = relNew[j];
-      if (rel[j] < best[j]) {
-        best[j] = rel[j];
-        for (let i = 0; i < n; i++) xBest[i * m + j] = x[i * m + j];
-      }
+      imp[j] = rel[j] < best[j] ? 1 : 0;
+      if (imp[j]) { best[j] = rel[j]; anyImp = true; }
       if (rel[j] <= opt.minGain * mark[j]) { mark[j] = rel[j]; markAt[j] = ref; }
       why[j] = okCol[j] ? stop(j, ref) : 'non-finite';
       if (why[j]) done[j] = 1;
+    }
+    if (anyImp) {
+      for (let i = 0; i < n; i++) {
+        const o = i * m;
+        for (let a = 0; a < na; a++) { const j = ac[a]; if (imp[j]) xBest[o + j] = x[o + j]; }
+      }
     }
     cpuMs += now() - tc;
     let innerRel = 0;
@@ -597,11 +610,14 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     history.push({ relres: maxOf(rel), iters: inner.its, innerRel, stagnated: inner.stagnated, active: act.length,
       ...(m <= 16 ? { cols: Array.from(rel), innerCols: act.map((j) => inner.colRel[j]) } : {}) });
   }
-  // return the best iterate of each column
+  // return the best iterate of each column (and the float64 floor at it)
   tc = now();
-  for (let j = 0; j < m; j++) {
-    if (!(rel[j] <= best[j])) {
-      for (let i = 0; i < n; i++) x[i * m + j] = xBest[i * m + j];
+  let restore = false;
+  for (let j = 0; j < m; j++) { imp[j] = rel[j] <= best[j] ? 0 : 1; if (imp[j]) restore = true; }
+  if (restore) {
+    for (let i = 0; i < n; i++) {
+      const o = i * m;
+      for (let j = 0; j < m; j++) if (imp[j]) x[o + j] = xBest[o + j];
     }
   }
   residualRowMajor(n, m, indptr, indices, data, x, b, r, floor);
@@ -666,7 +682,8 @@ function unsolved(n, k, indptr, indices, data, rhs, x0, reason, t0) {
   }
   return {
     x, iters: 0, refinements: 0, relres, ms: now() - t0, converged: false, tolMet: false,
-    floor: new Float64Array(k), stopped: new Array(k).fill('unsolved'), reason,
+    floor: new Float64Array(k), stopped: new Array(k).fill('unsolved'), reason, precond: 'none',
+    gpuMs: 0, cpuMs: 0, setupMs: 0, gpuBytes: 0, submits: 0,
   };
 }
 

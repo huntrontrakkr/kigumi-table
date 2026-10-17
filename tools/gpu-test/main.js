@@ -11,9 +11,13 @@ const t0 = performance.now();
 
 const fmt = (v, d = 1) => (v == null || Number.isNaN(v) ? '' : typeof v === 'number' ? (Math.abs(v) < 1e-3 || Math.abs(v) >= 1e5 ? v.toExponential(d) : v.toFixed(v % 1 ? 1 : 0)) : String(v));
 
+// ?post=1: send log lines and the final results to the test server (run.mjs --browser win-*)
+const post = (url, body) => (params.post ? fetch(url, { method: 'POST', body }).catch(() => {}) : null);
+
 function log(text) {
   logEl.textContent += text + '\n';
   console.log('[test] ' + text);     // run.mjs relays these
+  post('/__log', text);
 }
 
 function show(r) {
@@ -33,8 +37,11 @@ function show(r) {
     cell(fmt(r.relresMax)); cell(fmt(r.errMax)); cell(fmt(r.floorMax)); cell(fmt(r.setupMs)); cell(fmt(r.ms));
     cell(r.pass === true ? 'pass' : r.pass === false ? 'FAIL' : 'info', r.pass === true ? 'pass' : r.pass === false ? 'fail' : 'info');
     if (r.msPerIter != null && /^bench/.test(r.id)) log(`${r.id}: ${r.msPerIter.toFixed(3)} ms per PCG iteration (GPU time incl. read-backs)`);
+    if (r.reason) log(`${r.id}: not converged: ${r.reason}`);
     log(`${r.id}: iters ${r.iters}, refinements ${r.refinements}, relres ${fmt(r.relresMax, 2)}, err ${fmt(r.errMax, 2)}, ` +
-        `per refinement ${r.perRefinement.map((h) => `${h.iters}it->${fmt(h.relres, 1)}`).join(' ')}`);
+        `GPU buffers ${r.gpuBytes ? (r.gpuBytes / 2 ** 20).toFixed(2) + ' MiB' : '-'}, ${r.submits || 0} submissions, ` +
+        `per refinement ${(r.perRefinement || []).map((h) => `${h.iters}it->${fmt(h.relres, 1)}`).join(' ')}` +
+        (r.note ? ` (${r.note})` : ''));
   }
   rows.appendChild(tr);
 }
@@ -46,6 +53,7 @@ function finish(out) {
     `${out.ok ? 'all acceptance checks passed' : 'SOME CHECKS FAILED'} — ${out.results.length} cases, ` +
     `${(out.wallMs / 1000).toFixed(1)} s, ${mode} mode, adapter: ${out.gpu ? out.gpu.description : 'none'}`;
   window.__results = out;
+  post('/__results', JSON.stringify(out));
 }
 
 if (mode === 'main') {

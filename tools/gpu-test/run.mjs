@@ -1,20 +1,23 @@
-// Headless test run of the WebGPU sparse SPD solver (site/engine/gpu/sparse.js):
-// serves the repository over http://localhost (WebGPU needs a secure context),
-// opens tools/gpu-test/index.html in Playwright's Chromium with WebGPU enabled,
-// waits for window.__results, prints a summary and writes out/results.json.
+// Test run of the WebGPU sparse SPD solver (site/engine/gpu/sparse.js): serves
+// the repository over http://localhost (WebGPU needs a secure context), opens
+// tools/gpu-test/index.html in a browser, collects the results the page posts
+// back, prints a summary and writes out/results.json.
 //
-//   node tools/gpu-test/run.mjs [--cases id,group,...] [--compare] [--mode worker|main]
-//                               [--bigk 8|all] [--eta 1e-4] [--precond fsai] [--timeout 3600]
-//                               [--out results.json] [--headed]
+//   node tools/gpu-test/run.mjs [--browser chromium|win-chrome|win-edge] [--cases id,group,...]
+//                               [--compare] [--mode worker|main] [--bigk 8|all] [--eta 1e-4]
+//                               [--precond fsai] [--timeout 3600] [--out results.json] [--headed]
 //
+// --browser chromium (default): Playwright's headless Chromium from tools/ui-test/node_modules.
+//   On this machine it needs the libraries in ~/.local/lib/chromedeps and its WebGPU adapter is
+//   SwiftShader (CPU): correctness and iteration counts are real, timings are not.
+// --browser win-chrome | win-edge: (WSL2) the Windows host's Chrome or Edge, headless, on the
+//   real GPU, started through PowerShell and killed by PID at the end.  It reaches this server
+//   through WSL's localhost forwarding.
 // Exit code 0 when every case with acceptance criteria passes.
-// Reuses Playwright from tools/ui-test/node_modules.  On this machine Chromium needs
-// the libraries in ~/.local/lib/chromedeps; the adapter is SwiftShader (CPU), so
-// timings are not representative of a GPU -- correctness and iteration counts are.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import net from 'node:net';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -35,15 +38,15 @@ for (let i = 0; i < argv.length; i++) {
 const headed = !!flags.headed;
 const timeoutMs = (+flags.timeout || 3600) * 1000;
 const outFile = path.resolve(HERE, 'out', flags.out || 'results.json');
-delete flags.headed;
-delete flags.timeout;
-delete flags.out;
+const browserKind = flags.browser || 'chromium';
+for (const k of ['headed', 'timeout', 'out', 'browser']) delete flags[k];
 
-let chromium;
-try {
-  ({ chromium } = await import(pathToFileURL(path.join(ROOT, 'tools/ui-test/node_modules/playwright/index.mjs')).href));
-} catch (e) {
-  console.error('Playwright not found in tools/ui-test/node_modules (cd tools/ui-test && npm install):', e.message);
+const WIN_BROWSERS = {
+  'win-chrome': 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'win-edge': 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+};
+if (browserKind !== 'chromium' && !WIN_BROWSERS[browserKind]) {
+  console.error(`unknown --browser ${browserKind}`);
   process.exit(2);
 }
 
@@ -54,51 +57,88 @@ if (!fs.existsSync(path.join(HERE, 'data/manifest.json'))) {
   if (r.status !== 0) console.warn('convert.py failed: only the synthetic cases will run');
 }
 
-const freePort = () => new Promise((resolve, reject) => {
-  const s = net.createServer();
-  s.unref();
-  s.on('error', reject);
-  s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
+// ---- a static file server for the repository, plus /__log and /__results for the page
+const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json',
+  '.css': 'text/css', '.wasm': 'application/wasm' };
+let resolveResults;
+const resultsPosted = new Promise((r) => { resolveResults = r; });
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST') {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.end('ok');
+      if (req.url === '/__log') console.log(body);
+      else if (req.url === '/__results') resolveResults(JSON.parse(body));
+    });
+    return;
+  }
+  const rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  const file = path.resolve(ROOT, '.' + rel);
+  if (!file.startsWith(ROOT + path.sep)) { res.statusCode = 403; res.end(); return; }
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.statusCode = 404; res.end(); return; }
+    res.setHeader('Content-Type', TYPES[path.extname(file)] || 'application/octet-stream');
+    res.setHeader('Content-Length', st.size);
+    res.setHeader('Cache-Control', 'no-store');
+    fs.createReadStream(file).pipe(res);
+  });
 });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
 
-const port = await freePort();
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: ROOT, stdio: 'ignore' });
-let browser = null;
+let browser = null;      // Playwright browser
+let winPid = null;       // Windows browser process id
 const cleanup = async () => {
-  if (browser) { try { await browser.close(); } catch { /* already gone */ } browser = null; }
-  if (server.exitCode === null && !server.killed) server.kill('SIGTERM');   // by PID
+  if (browser) { try { await browser.close(); } catch { /* gone */ } browser = null; }
+  if (winPid) { spawnSync('taskkill.exe', ['/PID', String(winPid), '/T', '/F'], { stdio: 'ignore' }); winPid = null; }
+  server.close();
 };
 process.on('SIGINT', async () => { await cleanup(); process.exit(130); });
 
 let exitCode = 1;
 try {
-  const base = `http://localhost:${port}`;
-  for (let i = 0; ; i++) {
-    try { if ((await fetch(`${base}/tools/gpu-test/index.html`)).ok) break; } catch { /* not up yet */ }
-    if (i > 100) throw new Error('http.server did not start');
-    await new Promise((r) => setTimeout(r, 100));
+  const query = new URLSearchParams({ ...flags, post: '1' }).toString();
+  const url = `http://localhost:${port}/tools/gpu-test/index.html?${query}`;
+  if (browserKind === 'chromium') {
+    let chromium;
+    try {
+      ({ chromium } = await import(pathToFileURL(path.join(ROOT, 'tools/ui-test/node_modules/playwright/index.mjs')).href));
+    } catch (e) {
+      throw new Error('Playwright not found in tools/ui-test/node_modules (cd tools/ui-test && npm install): ' + e.message);
+    }
+    const env = { ...process.env };
+    const deps = path.join(os.homedir(), '.local/lib/chromedeps');
+    if (fs.existsSync(deps)) env.LD_LIBRARY_PATH = deps + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
+    browser = await chromium.launch({
+      headless: !headed,
+      args: ['--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
+      env,
+    });
+    const page = await browser.newPage();
+    page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[page ${m.type()}] ${m.text()}`); });
+    page.on('pageerror', (e) => console.log('[pageerror]', e.message));
+    console.log(`open ${url}  (Playwright Chromium ${browser.version()})`);
+    await page.goto(url);
+  } else {
+    const exe = WIN_BROWSERS[browserKind];
+    const ps = [
+      `$p = Start-Process -PassThru -FilePath '${exe}' -ArgumentList @(`,
+      `'--headless=new', '--no-first-run', '--no-default-browser-check', '--disable-extensions',`,
+      `"--user-data-dir=$env:TEMP\\kigumi-gpu-test-${browserKind}", '${url}');`,
+      '$p.Id',
+    ].join(' ');
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' });
+    winPid = parseInt(String(r.stdout).trim(), 10);
+    if (!(winPid > 0)) throw new Error(`could not start ${exe}: ${r.stderr || r.stdout}`);
+    console.log(`open ${url}  (${browserKind}, Windows pid ${winPid})`);
   }
-  const env = { ...process.env };
-  const deps = path.join(os.homedir(), '.local/lib/chromedeps');
-  if (fs.existsSync(deps)) env.LD_LIBRARY_PATH = deps + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
-  browser = await chromium.launch({
-    headless: !headed,
-    args: ['--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
-    env,
-  });
-  const page = await browser.newPage();
-  page.on('console', (m) => {
-    const t = m.text();
-    if (m.type() === 'error' || m.type() === 'warning') console.log(`[page ${m.type()}] ${t}`);
-    else if (t.startsWith('[test] ')) console.log(t.slice(7));
-  });
-  page.on('pageerror', (e) => console.log('[pageerror]', e.message));
-  const query = new URLSearchParams(flags).toString();
-  const url = `${base}/tools/gpu-test/index.html${query ? '?' + query : ''}`;
-  console.log(`open ${url}  (Chromium ${browser.version()})`);
-  await page.goto(url);
-  await page.waitForFunction(() => window.__results, null, { timeout: timeoutMs, polling: 1000 });
-  const out = await page.evaluate(() => window.__results);
+  const out = await Promise.race([
+    resultsPosted,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`no results after ${timeoutMs / 1000} s`)), timeoutMs)),
+  ]);
+  out.browser = browserKind;
 
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
@@ -116,7 +156,7 @@ try {
   for (const r of rows) console.log(r.map((v, c) => (c === 0 ? String(v).padEnd(w[c]) : String(v).padStart(w[c]))).join('  '));
   for (const r of out.results) if (r.error) console.log(`\n${r.id}: ${r.error}`);
   console.log(`\nadapter: ${out.gpu ? JSON.stringify(out.gpu) : 'none'}${out.error ? '\nerror: ' + out.error : ''}`);
-  console.log(`${out.ok ? 'PASS' : 'FAIL'} (${out.mode} mode, ${(out.wallMs / 1000).toFixed(1)} s); details in ${path.relative(ROOT, outFile)}`);
+  console.log(`${out.ok ? 'PASS' : 'FAIL'} (${browserKind}, ${out.mode} mode, ${(out.wallMs / 1000).toFixed(1)} s); details in ${path.relative(ROOT, outFile)}`);
   exitCode = out.ok ? 0 : 1;
 } catch (err) {
   console.error(err);

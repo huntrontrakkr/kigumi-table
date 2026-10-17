@@ -12,6 +12,65 @@ import { laplace2d, beam1d } from './synthetic.js';
 
 const BASE = new URL('./', import.meta.url);
 
+// SuperLU in Pyodide (WebAssembly), the app's CPU path, for comparison: the version the
+// site's worker loads (site/engine/worker.js), from the CDN
+const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/';
+let pyodidePromise = null;
+function pyodide() {
+  if (!pyodidePromise) {
+    pyodidePromise = (async () => {
+      const { loadPyodide } = await import(PYODIDE + 'pyodide.mjs');
+      const py = await loadPyodide({ indexURL: PYODIDE });
+      await py.loadPackage(['numpy', 'scipy'], { messageCallback: () => {} });
+      return py;
+    })();
+  }
+  return pyodidePromise;
+}
+
+/** kigumi.linalg.factor(K).solve(B) under Pyodide, timed (best of `reps`). */
+async function superluCase(c, reps = 3) {
+  const py = await pyodide();
+  const put = (name, a) => py.FS.writeFile('/tmp/' + name, new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
+  put('indptr', Int32Array.from(c.indptr, Number));
+  put('indices', Int32Array.from(c.indices, Number));
+  put('data', c.data);
+  put('rhs', c.rhs);
+  put('xref', c.xref);
+  const t = performance.now();
+  const res = JSON.parse(py.runPython(`
+import json, time
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import splu
+n, k = ${c.n}, ${c.k}
+K = csr_matrix((np.fromfile('/tmp/data', dtype=np.float64), np.fromfile('/tmp/indices', dtype=np.int32),
+                np.fromfile('/tmp/indptr', dtype=np.int32)), shape=(n, n))
+B = np.fromfile('/tmp/rhs', dtype=np.float64).reshape(k, n).T.copy()
+Xref = np.fromfile('/tmp/xref', dtype=np.float64).reshape(k, n).T
+best = None
+for rep in range(${reps}):
+    t0 = time.perf_counter()
+    lu = splu(K.tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
+    t1 = time.perf_counter()
+    X = lu.solve(B)
+    t2 = time.perf_counter()
+    if best is None or t2 - t0 < sum(best):
+        best = (t1 - t0, t2 - t1)
+rel = np.linalg.norm(B - K @ X, axis=0) / np.maximum(np.linalg.norm(B, axis=0), 1e-300)
+err = np.linalg.norm(X - Xref, axis=0) / np.maximum(np.linalg.norm(Xref, axis=0), 1e-300)
+json.dumps(dict(factor_ms=best[0] * 1e3, solve_ms=best[1] * 1e3, relres=float(rel.max()), err=float(err.max())))
+`));
+  return {
+    name: `SuperLU (Pyodide) ${c.name}`, n: c.n, nnz: Number(c.indptr[c.n]), k: c.k, precond: 'superlu',
+    iters: 0, refinements: 0, relresMax: res.relres, errMax: res.err, floorMax: null,
+    ms: res.factor_ms + res.solve_ms, setupMs: res.factor_ms, gpuMs: 0, cpuMs: res.factor_ms + res.solve_ms,
+    note: `factor ${res.factor_ms.toFixed(1)} ms + solve ${res.solve_ms.toFixed(1)} ms (best of ${reps}); ` +
+      `wall ${(performance.now() - t).toFixed(0)} ms incl. data transfer`,
+    pass: null,
+  };
+}
+
 async function bin(name, Type) {
   const r = await fetch(new URL('data/' + name, BASE));
   if (!r.ok) throw new Error(`fetch data/${name}: ${r.status} (run convert.py?)`);
@@ -101,6 +160,15 @@ function plan(params, manifest) {
   if (meta.plate_model) {
     items.push({ id: 'plate_model', group: 'model', accept: ACCEPT,
       note: "the app's own call: the 'field-four' plate with all 123 load cases", make: () => exported('plate_model') });
+    items.push({ id: 'plate_model_warm', group: 'model', accept: ACCEPT,
+      note: 'the same call again: prepared matrix, pipelines and buffers cached',
+      make: async () => ({ ...(await exported('plate_model')), name: 'plate_model (warm)' }) });
+  }
+  // superlu: SuperLU in Pyodide on the same systems (needs the network for Pyodide)
+  for (const name of ['plate_model', 'plate_four', 'grillage_four', 'plate_big']) {
+    if (!meta[name]) continue;
+    items.push({ id: `superlu_${name}`, group: 'superlu', accept: null, custom: superluCase,
+      make: async () => { const c = await exported(name); return name === 'plate_big' && bigk && bigk < c.k ? columns(c, 0, bigk) : c; } });
   }
   if (meta.plate_big) {
     items.push({ id: 'plate_big', group: 'model', accept: ACCEPT,
@@ -121,6 +189,20 @@ function plan(params, manifest) {
   items.push({ id: 'device_lost', group: 'robust', accept: ACCEPT, note: 'device destroyed before the call: solveSPD takes a fresh one',
     before: async (gpu) => { gpu.device.destroy(); await gpu.device.lost; await new Promise((r) => setTimeout(r, 0)); },
     make: async () => ({ ...laplace2d(24, 24, 2), name: 'laplace2d after device loss' }) });
+  if (meta.plate_four) {
+    items.push({ id: 'too_big', group: 'robust', accept: null, opts: { memBudget: 2 ** 20 },
+      note: 'memory budget (1 MiB) below the matrix: converged = false with a reason, at once',
+      expect: (r) => !r.converged && /too large/.test(r.reason || '') && r.iters === 0 && r.ms < 200,
+      make: async () => ({ ...(await exported('plate_four')), name: 'plate_four, 1 MiB budget' }) });
+    items.push({ id: 'precond_stepdown', group: 'robust', accept: ACCEPT, opts: { memBudget: 3.5 * 2 ** 20 },
+      note: "budget fits FSAI level 1 but not level 2: steps down to 'fsai'",
+      expect: (r) => r.precond === 'fsai' && r.converged,
+      make: async () => columns(await exported('plate_four'), 0, 1, 'plate_four[0:1], 3.5 MiB budget') });
+  }
+  items.push({ id: 'short_submits', group: 'robust', accept: ACCEPT, opts: { submitMs: 1 },
+    note: 'submitMs = 1: about one iteration per queue submission',
+    expect: (r) => r.converged && r.submits >= r.iters / 4,
+    make: async () => ({ ...laplace2d(24, 24, 2), name: 'laplace2d, 1 ms submissions' }) });
   items.push({ id: 'not_spd', group: 'robust', expectError: /not SPD/, note: 'negative diagonal entry: must throw',
     make: async () => { const c = laplace2d(10, 10, 1); const d = Float64Array.from(c.data);
       for (let p = c.indptr[5]; p < c.indptr[6]; p++) if (c.indices[p] === 5) d[p] = -1;
@@ -151,7 +233,8 @@ function plan(params, manifest) {
     }
   }
   const only = params.cases ? new Set(params.cases.split(',')) : null;
-  return only ? items.filter((it) => only.has(it.id) || only.has(it.group)) : items.filter((it) => !it.bench);
+  return only ? items.filter((it) => only.has(it.id) || only.has(it.group))
+    : items.filter((it) => !it.bench && it.group !== 'superlu');
 }
 
 export async function runAll(params, onCase = () => {}, onLog = () => {}) {
@@ -176,6 +259,12 @@ export async function runAll(params, onCase = () => {}, onLog = () => {}) {
       c = await item.make();
       if (item.before) await item.before(gpu);
       onLog(`${item.id}: n=${c.n} nnz=${Number(c.indptr[c.indptr.length - 1])} k=${c.k} ...`);
+      if (item.custom) {
+        res = { id: item.id, ...(await item.custom(c)) };
+        results.push(res);
+        onCase(res);
+        continue;
+      }
       const r = await sparse.solveSPD(gpu, {
         n: c.n, k: c.k, indptr: c.indptr, indices: c.indices, data: c.data, rhs: c.rhs,
         x0: item.x0 ? item.x0(c) : undefined, ...opts, ...(item.opts || {}), ...(item.precond ? { precond: item.precond } : {}),
@@ -184,7 +273,13 @@ export async function runAll(params, onCase = () => {}, onLog = () => {}) {
         res = { id: item.id, name: c.name, error: 'expected an error, got a result', pass: false };
       } else {
         res = score(item, { ...c, indptr: Int32Array.from(c.indptr, Number) }, r);
-        if (item.expect && !item.expect(r)) { res.pass = false; res.note = 'unexpected: ' + (item.note || ''); }
+        if (item.expect) {
+          if (!item.expect(r)) { res.pass = false; res.note = 'unexpected: ' + (item.note || ''); }
+          else if (res.pass === null) res.pass = true;
+        }
+        if (r.reason) res.reason = r.reason;
+        res.submits = r.submits;
+        res.gpuBytes = r.gpuBytes;
       }
     } catch (e) {
       const msg = String((e && e.message) || e);
