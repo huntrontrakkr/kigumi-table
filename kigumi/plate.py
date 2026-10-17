@@ -25,7 +25,6 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import splu
 
 
 def _hermite(x: float, h: float):
@@ -177,7 +176,6 @@ def solve_plate(region, supports: list[tuple[np.ndarray, float]], load: float, q
     hd = (4 * np.nonzero(held)[0][:, None] + np.arange(3)[None, :]).ravel()
     pen = 1e6 * float(Ke.diagonal().max())
     K = K + coo_matrix((np.full(len(hd), pen), (hd, hd)), shape=(ndof, ndof)).tocsr()
-    lu = splu(K.tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
 
     def load_vec(weights):
         f = np.zeros(ndof)
@@ -204,7 +202,8 @@ def solve_plate(region, supports: list[tuple[np.ndarray, float]], load: float, q
             w[int(np.argmin((xs[:, 0] - c[0]) ** 2 + (xs[:, 1] - c[1]) ** 2))] = 1.0
         cases.append(load_vec(w * (load / (w.sum() * area_e))))
     F = np.stack(cases, axis=1)
-    U = lu.solve(F)                                   # (ndof, cases); D = 1 cancels for moments
+    from .linalg import solve_many
+    U = solve_many(K, F)                              # (ndof, cases); D = 1 cancels for moments
     Ue = U[dofs, :]                                   # (ne, 16, cases)
     M = np.einsum("rk,ekc->cer", Mc, Ue)              # (cases, ne, 3)
     return PlateField(xs=xs, M=M, h=h, area=float(ne * area_e), origin=(ox, oy), shape=(nx, ny),

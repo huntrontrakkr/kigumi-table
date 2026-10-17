@@ -1,0 +1,10 @@
+{
+  "name": "kigumi-web-engine-test",
+  "private": true,
+  "type": "module",
+  "description": "Runs the kigumi Python package under Pyodide in Node, with Manifold's WebAssembly build",
+  "devDependencies": {
+    "pyodide": "314.0.7",
+    "manifold-3d": "3.5.4"
+  }
+}

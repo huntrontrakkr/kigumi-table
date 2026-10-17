@@ -416,15 +416,14 @@ class Grillage:
         key = active.tobytes()
         if key in self._lu:
             return self._lu[key]
-        from scipy.sparse.linalg import splu
         on = active | self._bil
         Ca = self._C[on]
         K = self._Kbase + self.kc * (Ca.T @ Ca)
         # symmetric positive definite: a symmetric ordering without pivoting
         # factors 2-3x faster than the default (and with less fill)
-        lu = splu(K.tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0,
-                  options=dict(SymmetricMode=True))
-        if len(self._lu) > 64:
+        from .linalg import factor
+        lu = factor(K)
+        if len(self._lu) > 8:              # each factor holds ~10 MB: keep the WebAssembly heap small
             self._lu.clear()
         self._lu[key] = lu
         return lu
@@ -550,6 +549,7 @@ def check_structure(d: Design, n_points: int = 28) -> list[dict]:
         sig_u, bid_u, _ = g.stresses(u)
     else:
         sig_u, bid_u = 0.0, None
+    g._lu.clear()                       # free the factorizations now (they are large)
     out = []
     if worst["unstable"]:
         out.append(item("Load path", "fail", 0, 0,

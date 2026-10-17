@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import manifold3d as m3d
+from .m3d import m3d
 
 from .model import Part, prism
 from .params import Params

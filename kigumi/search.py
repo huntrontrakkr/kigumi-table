@@ -47,6 +47,9 @@ def evaluate(args) -> dict:
 def best_of(seed0: int, n: int = 12, base: dict | None = None, keep: list | None = None,
             jitter: float = 0.0) -> list[dict]:
     jobs = [(seed0 + 7919 * i, base, keep, jitter) for i in range(n)]
-    res = list(_pool().map(evaluate, jobs))
+    try:
+        res = list(_pool().map(evaluate, jobs))
+    except (ImportError, NotImplementedError, OSError, RuntimeError):
+        res = [evaluate(j) for j in jobs]          # no processes (e.g. the browser): one by one
     res.sort(key=lambda r: r["score"], reverse=True)
     return res

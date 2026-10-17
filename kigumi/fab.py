@@ -20,7 +20,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import ezdxf
-import manifold3d as m3d
+from .m3d import m3d
 import numpy as np
 
 from .build import Design

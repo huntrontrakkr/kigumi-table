@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
-import manifold3d as m3d
+from .m3d import m3d
 import numpy as np
 from shapely.geometry import MultiPoint, Point, Polygon
 from shapely.geometry.polygon import orient
