@@ -12,6 +12,8 @@ plate (the first 8 of its load cases) and its grillage with every contact active
 (the dead load), with SuperLU references.  The matrices are those of the original
 export; the hand-exported originals used other right-hand sides.
 
+plate_model: the same 'field-four' plate with all 123 load cases, as the app solves it.
+
 Unless --no-big: also a larger plate (plate_big, ~15k dof, 90 load cases) built
 with kigumi.plate.solve_plate exactly as the model builds its systems, with a
 SuperLU reference solution -- the size the solver meets in practice.
@@ -80,6 +82,26 @@ def reference(K, B) -> np.ndarray:
     for _ in range(3):
         X += lu.solve(B - K @ X)
     return X
+
+
+def plate_model() -> dict:
+    """data/plate_model.*: the 'field-four' top plate with all its load cases, exactly the
+    system kigumi.linalg.solve_many hands the GPU in the app (k = 123)."""
+    sys.path.insert(0, str(ROOT))
+    from kigumi import linalg
+    from kigumi.build import build
+    from kigumi.params import preset
+
+    plate = []
+    linalg.set_accelerator(lambda K, B: plate.append((K.tocsr(), np.array(B, dtype=float))) and None)
+    try:
+        build(preset("field-four"))
+    finally:
+        linalg.set_accelerator(None)
+    K, B = plate[0]
+    return write_case("plate_model", K, B, reference(K, B),
+                      "the 'field-four' top plate with all its load cases, as solve_many passes it in the app",
+                      dict(relres=1e-8, err=1e-6))
 
 
 def export_model() -> None:
@@ -174,6 +196,7 @@ def main() -> None:
                  dict(relres=1e-8, err=1e-6)),
         exported("grillage_four", "beams + glass plate + penalty contacts", dict(relres=1e-8, err=1e-6)),
     ]
+    cases.append(plate_model())
     if not args.no_big:
         cases.append(plate_big())
     (DATA / "manifest.json").write_text(json.dumps(dict(cases=cases), indent=1))

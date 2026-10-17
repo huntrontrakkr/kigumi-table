@@ -98,6 +98,10 @@ function plan(params, manifest) {
       make: async () => ({ ...(await exported('plate_four')), name: 'plate_four (warm x0)' }) });
   }
   if (meta.grillage_four) items.push({ id: 'grillage_four', group: 'model', accept: ACCEPT, make: () => exported('grillage_four') });
+  if (meta.plate_model) {
+    items.push({ id: 'plate_model', group: 'model', accept: ACCEPT,
+      note: "the app's own call: the 'field-four' plate with all 123 load cases", make: () => exported('plate_model') });
+  }
   if (meta.plate_big) {
     items.push({ id: 'plate_big', group: 'model', accept: ACCEPT,
       make: async () => { const c = await exported('plate_big'); return bigk && bigk < c.k ? columns(c, 0, bigk) : c; } });
