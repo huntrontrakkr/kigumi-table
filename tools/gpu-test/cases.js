@@ -5,7 +5,7 @@
 // URL parameters (forwarded by index.html):
 //   cases=a,b,...   subset of case ids (default: all of the default plan)
 //   compare=1       also run plate_four / grillage_four with the jacobi and fsai (level 1) preconditioners
-//   bigk=K          right-hand sides of plate_big to solve (default: all 90)
+//   bigk=K|all      right-hand sides of plate_big to solve (default 8 of 90)
 //   eta, precond, checkEvery, maxIter, tol    forwarded to solveSPD
 
 import { laplace2d, beam1d } from './synthetic.js';
@@ -52,6 +52,7 @@ function score(item, c, r) {
   if (r.floor) for (let j = 0; j < k; j++) floorMax = Math.max(floorMax, r.floor[j]);
   const acc = item.accept;
   const pass = acc ? relresMax <= acc.relres && errMax <= acc.err : null;
+  if (item.bench) errMax = null;
   const hist = Array.isArray(r.history?.[0]) ? r.history.flat() : (r.history || []);
   return {
     id: item.id, name: c.name, n, nnz: c.indptr[n], k, precond: r.precond,
@@ -60,6 +61,7 @@ function score(item, c, r) {
     perRefinement: hist.map((h) => ({ relres: h.relres, iters: h.iters, innerRel: h.innerRel, stagnated: h.stagnated, cols: h.cols })),
     stopped: r.stopped && r.stopped.length <= 16 ? r.stopped : undefined, tolMet: r.tolMet,
     accept: acc || null, pass, note: item.note || c.note,
+    msPerIter: r.iters ? r.gpuMs / r.iters : null,
   };
 }
 
@@ -73,7 +75,8 @@ function plan(params, manifest) {
     if (!cache.has(name)) cache.set(name, loadExported(meta[name]));
     return cache.get(name);
   };
-  const bigk = params.bigk ? +params.bigk : null;
+  // plate_big: 8 of its 90 right-hand sides by default (SwiftShader is slow); bigk=all for every one
+  const bigk = params.bigk === 'all' ? null : +(params.bigk || 8);
   const items = [];
   // layouts: lane widths 1/2/4, padded and non-power-of-two column groups
   for (const k of [1, 2, 3, 5, 33]) {
@@ -117,6 +120,21 @@ function plan(params, manifest) {
       return { ...c, data: d, name: 'negative diagonal' }; } });
   items.push({ id: 'bad_csr', group: 'robust', expectError: /indptr/, note: 'indptr of the wrong length: must throw',
     make: async () => { const c = laplace2d(10, 10, 1); return { ...c, indptr: c.indptr.subarray(0, c.n), name: 'malformed CSR' }; } });
+  // bench: fixed iteration counts (eta ~ 0, one refinement) for per-iteration GPU cost; open
+  // index.html?cases=bench in a browser with a real GPU to measure it there (informational)
+  if (meta.plate_four) {
+    for (const k of [1, 8, 64, 256]) {
+      items.push({ id: `bench_k${k}`, group: 'bench', accept: null, bench: true,
+        opts: { eta: 1e-30, maxRefine: 1, maxIter: +(params.benchIters || 200), checkEvery: 32 },
+        note: 'per-iteration cost: plate_four, fixed iterations',
+        make: async () => {
+          const c = await exported('plate_four');
+          const rhs = new Float64Array(c.n * k);
+          for (let j = 0; j < k; j++) rhs.set(c.rhs.subarray((j % c.k) * c.n, (j % c.k + 1) * c.n), j * c.n);
+          return { ...c, k, rhs, xref: new Float64Array(c.n * k), name: `bench plate_four k=${k}` };
+        } });
+    }
+  }
   if (params.compare) {
     for (const name of ['plate_four', 'grillage_four']) {
       if (!meta[name]) continue;
@@ -126,7 +144,7 @@ function plan(params, manifest) {
     }
   }
   const only = params.cases ? new Set(params.cases.split(',')) : null;
-  return only ? items.filter((it) => only.has(it.id) || only.has(it.group)) : items;
+  return only ? items.filter((it) => only.has(it.id) || only.has(it.group)) : items.filter((it) => !it.bench);
 }
 
 export async function runAll(params, onCase = () => {}, onLog = () => {}) {

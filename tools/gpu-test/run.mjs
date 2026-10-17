@@ -4,7 +4,7 @@
 // waits for window.__results, prints a summary and writes out/results.json.
 //
 //   node tools/gpu-test/run.mjs [--cases id,group,...] [--compare] [--mode worker|main]
-//                               [--bigk 16] [--eta 1e-4] [--precond fsai] [--timeout 3600]
+//                               [--bigk 8|all] [--eta 1e-4] [--precond fsai] [--timeout 3600]
 //                               [--out results.json] [--headed]
 //
 // Exit code 0 when every case with acceptance criteria passes.
@@ -103,12 +103,13 @@ try {
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, JSON.stringify(out, null, 1));
   const e = (v) => (v == null ? '' : Number(v).toExponential(1));
-  const rows = [['case', 'n', 'k', 'precond', 'iters', 'refs', 'relres', 'error', 'floor', 'setup ms', 'total ms', 'result']];
+  const rows = [['case', 'n', 'k', 'precond', 'iters', 'refs', 'relres', 'error', 'floor', 'setup ms', 'total ms', 'ms/iter', 'result']];
   for (const r of out.results) {
-    rows.push(r.expectedError ? [r.name, '', '', '', '', '', '', '', '', '', '', 'pass (threw)']
-      : r.error ? [r.id, '', '', '', '', '', '', '', '', '', '', 'ERROR']
+    rows.push(r.expectedError ? [r.name, '', '', '', '', '', '', '', '', '', '', '', 'pass (threw)']
+      : r.error ? [r.id, '', '', '', '', '', '', '', '', '', '', '', 'ERROR']
       : [r.name, r.n, r.k, r.precond, r.iters, r.refinements, e(r.relresMax), e(r.errMax), e(r.floorMax),
-        Math.round(r.setupMs || 0), Math.round(r.ms), r.pass === true ? 'pass' : r.pass === false ? 'FAIL' : 'info']);
+        Math.round(r.setupMs || 0), Math.round(r.ms), r.msPerIter == null ? '' : r.msPerIter.toFixed(2),
+        r.pass === true ? 'pass' : r.pass === false ? 'FAIL' : 'info']);
   }
   const w = rows[0].map((_, c) => Math.max(...rows.map((r) => String(r[c]).length)));
   console.log('');

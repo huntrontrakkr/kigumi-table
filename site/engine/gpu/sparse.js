@@ -19,8 +19,11 @@
 //     all k columns at once (CSR SpMM), per-column alpha/beta and convergence
 //     flags computed on the GPU, read back only every few dozen iterations,
 //     run to a modest relative residual (eta, default 1e-4).
-// Each refinement gains roughly eta (limited by cond(G As G^T) * 2^-24), so
-// 1e-9 typically takes 3-4 refinements.  See tools/gpu-test/NOTES.md.
+// Each refinement cuts the error by about min(eta, cond(As) * 2^-24): on the
+// model's ~4.5k-dof systems 1e-9 takes 3 refinements of ~140-180 PCG
+// iterations; on a 15k-dof plate 6 refinements of ~550.  Refinement cannot
+// converge once cond(As) * 2^-24 approaches 1 (float32 cannot represent the
+// operator well enough).  See tools/gpu-test/NOTES.md for measurements.
 
 import { WG, NF, F, MAX_GRID, layoutFor, rowKernel, reduceKernel, axpyKernel, xpbyKernel } from './kernels.js';
 import {

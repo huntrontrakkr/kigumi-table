@@ -32,6 +32,7 @@ function show(r) {
     cell(r.n); cell(r.nnz); cell(r.k); cell(r.precond); cell(r.iters); cell(r.refinements);
     cell(fmt(r.relresMax)); cell(fmt(r.errMax)); cell(fmt(r.floorMax)); cell(fmt(r.setupMs)); cell(fmt(r.ms));
     cell(r.pass === true ? 'pass' : r.pass === false ? 'FAIL' : 'info', r.pass === true ? 'pass' : r.pass === false ? 'fail' : 'info');
+    if (r.msPerIter != null && /^bench/.test(r.id)) log(`${r.id}: ${r.msPerIter.toFixed(3)} ms per PCG iteration (GPU time incl. read-backs)`);
     log(`${r.id}: iters ${r.iters}, refinements ${r.refinements}, relres ${fmt(r.relresMax, 2)}, err ${fmt(r.errMax, 2)}, ` +
         `per refinement ${r.perRefinement.map((h) => `${h.iters}it->${fmt(h.relres, 1)}`).join(' ')}`);
   }
