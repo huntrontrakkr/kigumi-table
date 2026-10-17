@@ -412,9 +412,11 @@ async function innerSolve(gpu, st, rs, opt) {
   let havePrev = false;
   let stagnated = false;
   let submits = 0;
+  let maxPer = 0;
   let sc = null;
   for (;;) {
     const per = st.msPerIter ? Math.max(1, Math.min(m, Math.floor(opt.submitMs / st.msPerIter))) : 1;
+    if (per > maxPer) maxPer = per;
     const t0 = now();
     for (let left = m; left > 0;) {
       const s = Math.min(per, left);
@@ -473,7 +475,7 @@ async function innerSolve(gpu, st, rs, opt) {
     const rr0 = sc[F.RR0 * kp + j];
     colRel[j] = rr0 > 0 ? Math.sqrt(Math.max(0, sc[F.RR * kp + j]) / rr0) : 0;
   }
-  return { X, its, colIts, colRel, stagnated, submits };
+  return { X, its, colIts, colRel, stagnated, submits, maxPer };
 }
 
 // ----------------------------------------------------------- outer solve
@@ -516,6 +518,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   let cpuMs = now() - tc;
   let gpuMs = 0;
   let submits = 0;
+  let maxPer = 0;
   const best = Float64Array.from(rel);          // lowest relres so far (iterate in xBest)
   const mark = Float64Array.from(rel);          // relres at the last halving ...
   const markAt = new Int32Array(m).fill(-1);    // ... and when
@@ -571,6 +574,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     gpuMs += now() - tg;
     iters += inner.its;
     submits += inner.submits;
+    if (inner.maxPer > maxPer) maxPer = inner.maxPer;
     refinements++;
     // x += S d (columns with a non-finite correction are left alone and stop)
     tc = now();
@@ -625,7 +629,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   cpuMs += now() - tc;
   for (let j = 0; j < m; j++) if (!why[j]) why[j] = 'maxRefine';
   return { x, relres: relFinal, floor, iters, refinements, history, gpuMs, cpuMs, kp, why, failure,
-    gpuBytes: st ? st.bytes : 0, submits, msPerIter: st ? st.msPerIter : 0 };
+    gpuBytes: st ? st.bytes : 0, submits, maxPer, msPerIter: st ? st.msPerIter : 0 };
 }
 
 // -------------------------------------------------------------------- API
@@ -645,8 +649,10 @@ let queue = Promise.resolve();
  *   attainable-residual estimate u||A||x|+|b||/||b|| of each column), tolMet
  *   (every relres <= tol), stopped (per column: 'tol' | 'floor' | 'stalled' |
  *   'maxRefine' | 'non-finite' | 'gpu' | 'unsolved'), reason (why not
- *   converged, when it is a resource problem), setupMs, gpuMs, cpuMs, gpuBytes,
- *   submits, precond, history.
+ *   converged, when it is a resource problem), setupMs, gpuMs, cpuMs, gpuBytes
+ *   (GPU buffers of the solve), submits / maxItersPerSubmit / msPerIter (queue
+ *   submissions, the most PCG iterations in one, measured ms per iteration),
+ *   precond, history.
  * converged: every column has relres <= tol, or relres <= floorFactor * floor
  *   (solved to float64 working precision: no float64 method -- SuperLU
  *   included -- certifies a smaller residual for that column).  Use tolMet for
@@ -749,6 +755,7 @@ async function solveImpl(gpu, o) {
   let cpuMs = 0;
   let gpuBytes = 0;
   let submits = 0;
+  let maxItersPerSubmit = 0;
   let msPerIter = 0;
   let reason;
   const history = [];
@@ -766,6 +773,7 @@ async function solveImpl(gpu, o) {
     cpuMs += r.cpuMs;
     gpuBytes = Math.max(gpuBytes, r.gpuBytes);
     submits += r.submits;
+    maxItersPerSubmit = Math.max(maxItersPerSubmit, r.maxPer);
     msPerIter = r.msPerIter || msPerIter;
     history.push(r.history);
     if (r.failure) {
@@ -792,7 +800,7 @@ async function solveImpl(gpu, o) {
   return {
     x, iters, refinements, relres, ms: now() - t0, converged, tolMet, floor, stopped,
     ...(reason ? { reason } : {}),
-    precond, setupMs: fresh ? prep.setupMs : 0, gpuMs, cpuMs, gpuBytes, submits, msPerIter,
+    precond, setupMs: fresh ? prep.setupMs : 0, gpuMs, cpuMs, gpuBytes, submits, maxItersPerSubmit, msPerIter,
     fsaiFails: prep.fsaiFails, chunks: nchunks, history: nchunks === 1 ? history[0] : history,
   };
 }

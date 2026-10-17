@@ -200,8 +200,8 @@ function plan(params, manifest) {
       make: async () => columns(await exported('plate_four'), 0, 1, 'plate_four[0:1], 3.5 MiB budget') });
   }
   items.push({ id: 'short_submits', group: 'robust', accept: ACCEPT, opts: { submitMs: 1 },
-    note: 'submitMs = 1: about one iteration per queue submission',
-    expect: (r) => r.converged && r.submits >= r.iters / 4,
+    note: 'submitMs = 1: each queue submission holds about 1 ms of measured GPU work',
+    expect: (r) => r.converged && r.maxItersPerSubmit * r.msPerIter <= 3 + r.msPerIter,
     make: async () => ({ ...laplace2d(24, 24, 2), name: 'laplace2d, 1 ms submissions' }) });
   items.push({ id: 'not_spd', group: 'robust', expectError: /not SPD/, note: 'negative diagonal entry: must throw',
     make: async () => { const c = laplace2d(10, 10, 1); const d = Float64Array.from(c.data);
@@ -279,6 +279,7 @@ export async function runAll(params, onCase = () => {}, onLog = () => {}) {
         }
         if (r.reason) res.reason = r.reason;
         res.submits = r.submits;
+        res.maxItersPerSubmit = r.maxItersPerSubmit;
         res.gpuBytes = r.gpuBytes;
       }
     } catch (e) {
