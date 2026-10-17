@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kigumi table</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1.5' y='1.5' width='13' height='13' fill='%23F3EFE6' stroke='%2326231F'/%3E%3Cpath d='M1.5 6h13M1.5 10h13M6 1.5v13M10 1.5v13' stroke='%2326231F' stroke-width='.8'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three.module.js",
+    "three/addons/": "/vendor/addons/"
+  }
+}
+</script>
+<script type="module" src="/app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" fill="none" stroke="currentColor"/><path d="M1.5 6h13M1.5 10h13M6 1.5v13M10 1.5v13" stroke="currentColor" stroke-width=".7"/></svg>
+    <span class="title">kigumi table</span>
+  </div>
+  <div class="tools">
+    <label class="field"><span class="flabel">preset</span><select id="preset" aria-label="Preset"></select></label>
+    <span class="sep" aria-hidden="true"></span>
+    <button type="button" id="btn-random" class="btn" title="Resample every parameter outside locked groups (R)">Randomize <kbd>R</kbd></button>
+    <button type="button" id="btn-mutate" class="btn" title="Nudge 3–6 numbers outside locked groups (M)">Mutate <kbd>M</kbd></button>
+    <span class="hist">
+      <button type="button" id="btn-undo" class="icon" title="Previous design (Ctrl+Z)" aria-label="Undo" disabled><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M5 3.5 L2.2 6.2 L5 8.9 M2.4 6.2 H8.6 a3 3 0 0 1 0 6 H6.8" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <button type="button" id="btn-redo" class="icon" title="Next design (Ctrl+Shift+Z)" aria-label="Redo" disabled><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M9 3.5 L11.8 6.2 L9 8.9 M11.6 6.2 H5.4 a3 3 0 0 0 0 6 H7.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    </span>
+    <label class="field seedbox" title="Seed of the current design — type one and press Enter to re-roll it"><span class="flabel">seed</span><input id="seed" type="number" min="0" step="1" inputmode="numeric" aria-label="Seed"></label>
+  </div>
+  <div class="actions">
+    <button type="button" id="btn-render" class="btn" title="Photo-real render in Blender Cycles (10–30 s)"><span class="dotwork" aria-hidden="true"></span>Render photo</button>
+    <button type="button" id="btn-export" class="btn" title="Write fabrication files">Export</button>
+  </div>
+</header>
+
+<aside class="panel params" aria-label="Parameters">
+  <div class="filter"><svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="6" cy="6" r="3.8" fill="none" stroke="currentColor"/><path d="M8.8 8.8 L12 12" stroke="currentColor" stroke-linecap="round"/></svg><input id="filter" type="search" placeholder="filter parameters" aria-label="Filter parameters" autocomplete="off" spellcheck="false"><kbd>/</kbd></div>
+  <div id="params"></div>
+</aside>
+
+<section class="stage" id="stage" aria-label="3D view">
+  <div id="gl-host"></div>
+  <div class="vignette" aria-hidden="true"></div>
+  <div class="busyline" aria-hidden="true"></div>
+  <div class="status"><span id="busy-label"></span></div>
+  <div class="viewtools">
+    <button type="button" id="btn-glass" class="chip" aria-pressed="true" title="Show or hide the glass top (G)">Glass <kbd>G</kbd></button>
+    <button type="button" id="btn-frame" class="chip" title="Frame the table (F)">Frame <kbd>F</kbd></button>
+  </div>
+  <div class="hint" aria-hidden="true">drag to orbit · right-drag to pan · scroll to zoom · <kbd>E</kbd> explode</div>
+  <div id="tip" class="tip" role="tooltip"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div class="dock">
+    <div class="explode">
+      <label for="explode">Explode</label>
+      <input id="explode" class="slider" type="range" min="0" max="1" step="0.01" value="0">
+      <span id="explode-val" class="dval">assembled</span>
+    </div>
+    <div class="assembly" id="assembly">
+      <button type="button" id="play" class="play" aria-pressed="false" title="Play the assembly"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3.5 2.2 L9.6 6 L3.5 9.8 Z" fill="currentColor"/></svg></button>
+      <label for="step" class="steplabel">Assembly</label>
+      <input id="step" class="slider" type="range" min="1" max="1" step="1" value="1">
+      <span class="stepcap"><b id="step-num">–</b> <span id="step-text"></span></span>
+    </div>
+  </div>
+</section>
+
+<aside class="panel report" id="report" aria-label="Design report"></aside>
+
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lb-card" role="dialog" aria-modal="true" aria-labelledby="lb-title">
+    <header class="lb-head"><h2 id="lb-title"></h2><button type="button" id="lb-close" class="x" aria-label="Close">×</button></header>
+    <div id="lb-body" class="lb-body"></div>
+  </div>
+</div>
+</body>
+</html>

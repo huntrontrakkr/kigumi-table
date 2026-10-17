@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# generated renders, exports and server caches
+out/
+*.glb
+*.stl
+*.3dm
+
+# node / browser tooling
+node_modules/
+tools/ui-test/shots/
+
+# the web build packs the Python sources here (CI does it for Pages)
+site/py/
+.DS_Store

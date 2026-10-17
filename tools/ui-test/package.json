@@ -1,0 +1,13 @@
+{
+  "name": "kigumi-ui-test",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Headless browser smoke test + screenshots for the kigumi configurator",
+  "type": "module",
+  "scripts": {
+    "test": "node ui-test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.55.1"
+  }
+}
