@@ -176,6 +176,20 @@ The stem profile is continuous, so the configurator and the random search can mi
 bulb. `leg_sweep` and `leg_swirl` bow the stem outward or sideways. Splayed legs default to
 `leg_splay="tilt"`: a straight turned leg set at an angle, which stays lathe work.
 
+**Auto splay** (`auto_splay`, off by default) leans the feet out until a 600 N push on the rim
+cannot tip the table (`kigumi/stance.py`). Each step works like this:
+
+1. Estimate the weight and its centre from the layout. The estimate lands within about 2% and 2 mm
+   of the real solids.
+2. Find the edge of the feet's support polygon that the table tips over first.
+3. Push that edge out by exactly what it lacks. Its two feet move along its outward normal.
+
+The move is averaged over the layout's symmetry, so symmetric tables stay exactly symmetric. Each
+foot then stays within 18 degrees of vertical and keeps its footprint under the glass. The tipping
+check, on the real solids, certifies the result. Across the presets and 16 random designs it
+turned 4 passes into 14. Where it still falls short, the glass reaches too far past the legs for any
+reasonable splay, and the layout notes say so.
+
 ## Sending it off to be made
 
 `FABRICATION.md` in every export says who makes what and from which file:
@@ -245,7 +259,7 @@ one-metre top.
   random sampling.
 * **Organic layouts need checking.** Spiral, scatter, wave and free layouts are asymmetric by
   nature. Where the outline reaches far past the feet, the table can tip under a hand on the rim,
-  and the tipping check flags it. Pull the field in, lean the feet out, or add a leg.
+  and the tipping check flags it. Turn on auto splay, pull the field in, or add a leg.
 * Front-end tests, all in `tools/ui-test`:
   * `node ui-test.mjs --url http://127.0.0.1:8765/ --quick`: the local server.
   * `node site-smoke.mjs --url http://localhost:8790/ [--browser firefox|webkit]`: the browser build.

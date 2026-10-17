@@ -143,7 +143,8 @@ def _bd_nominal(bd, q, d: Design):
     if q.kind == "leg":
         st = q.meta["stations"]
         L = lay.legs[q.meta["leg"]]
-        if p.leg_lean == 0 and p.leg_capital == "round" and p.leg_sweep == 0 and p.leg_swirl == 0:
+        upright = float(np.hypot(*(L.foot_xy - L.xy))) < 1e-6
+        if upright and p.leg_capital == "round" and p.leg_sweep == 0 and p.leg_swirl == 0:
             return _bd_revolve(bd, list(zip(st["r"], st["z"])), L.xy)
         # lofted sections for leaning or polygonal stems
         from .profiles import section_radius
@@ -499,7 +500,7 @@ def cutlist_rows(d: Design):
                          finished=(f"leg {q.zmax:.0f} tall, max dia {dmax:.0f}; post dia {p.post_d:.1f} x {post_len:.0f}"
                                    if integral else f"leg {q.zmax:.0f} tall, max dia {dmax:.0f}; threaded socket dia "
                                                     f"{p.post_d:.1f} x {p.dowel_engage:.0f}"),
-                         notes=("lathe" if legs_turnable(p) else "not lathe-turnable (lean, sweep, swirl or polygonal capital)")
+                         notes=("lathe" if legs_turnable(p, d) else "not lathe-turnable (lean, sweep, swirl or polygonal capital)")
                                + "; capital slots differ per leg (see drawings)"))
     posts = [q for q in d.parts if q.kind == "post"]
     if posts and p.post_mode == "dowel":
@@ -775,9 +776,16 @@ RATE_CNC, RATE_TURN = 120.0, 75.0          # $/h
 GLASS_SQFT, GLASS_HOLE, GLASS_EDGE_FT = 38.0, 12.0, 4.0
 
 
-def legs_turnable(p) -> bool:
+def leg_splay_deg(d: Design) -> float:
+    """The largest angle a leg's axis leans from vertical (its foot off its capital)."""
+    return max((math.degrees(math.atan2(float(np.hypot(*(L.foot_xy - L.xy))), max(L.z_top, 1.0)))
+                for L in d.layout.legs), default=0.0)
+
+
+def legs_turnable(p, d: Design | None = None) -> bool:
     """A leg is lathe work if its axis is straight (it may be tilted to splay)."""
-    straight = p.leg_lean == 0 or p.leg_splay == "tilt"
+    leans = (leg_splay_deg(d) > 0.01) if d is not None else p.leg_lean != 0
+    straight = not leans or p.leg_splay == "tilt"
     return straight and p.leg_sweep == 0 and p.leg_swirl == 0 and p.leg_capital == "round"
 
 
@@ -794,7 +802,7 @@ def fabrication_md(d: Design, cnc: dict, checks: list, cad: bool = True) -> str:
     wood_cost = (bdft(strip_vol) * PRICE_BDFT.get(p.wood_beams, 12) + bdft(leg_blank) * PRICE_BDFT.get(p.wood_legs, 12)
                  + bdft(cap_blank) * PRICE_BDFT.get(p.wood_caps, 12))
     cnc_h = 0.75 + cnc["cut_length_m"] * 3 / (2.5 * 60) + cnc["dogbones"] * 3 / 3600
-    turn_h = (len(legs) * (2.0 if legs_turnable(p) else 5.0) + len(legs) * 0.75
+    turn_h = (len(legs) * (2.0 if legs_turnable(p, d) else 5.0) + len(legs) * 0.75
               + (len(legs) * 0.5 if p.post_mode == "dowel" else 0))
     glass = ""
     glass_cost = 0.0
@@ -825,9 +833,9 @@ def fabrication_md(d: Design, cnc: dict, checks: list, cad: bool = True) -> str:
            "and bottom edges (two setups per strip; table.step has the exact solids). The outlines in cnc_strips.dxf give "
            "lengths and end curves only. | table.step, beams.dxf, cutlist.csv |"),
           f"| legs | {len(legs)} | " + ("woodturner: turn to the full-size template, rout the capital slots with a jig, drill and "
-                                       "tap the centre socket" + (f"; the legs splay {math.degrees(math.atan2(abs(p.leg_lean), legs[0].zmax)):.1f} deg, "
-                                       "so trim the foot and capital faces level after turning" if p.leg_lean else "")
-                                       if legs_turnable(p) else
+                                       "tap the centre socket" + (f"; the legs splay up to {leg_splay_deg(d):.1f} deg, "
+                                       "so trim the foot and capital faces level after turning" if leg_splay_deg(d) > 0.05 else "")
+                                       if legs_turnable(p, d) else
                                        "CNC carving (4/5-axis) or hand carving: these stems lean, bow or swirl, so they are "
                                        "not lathe work") + " | drawings.pdf (turning template, capital slots), table.step |",
           (f"| threaded dowels dia {p.post_d:.0f} | {len(legs)} | {p.post_wood} dowel, wood thread both ends "

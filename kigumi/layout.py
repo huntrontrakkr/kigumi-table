@@ -1022,6 +1022,9 @@ def build_layout(p: Params, structural: bool = True) -> Layout:
         if covered and fails == 0:
             break
     key, c, fails, lay = best
+    if p.auto_splay:
+        from .stance import splay_feet
+        splay_feet(lay)
     T = len(lay.z_tiers)
     if T != int(p.tiers):
         why = ("the lattice carries the design load" if first_covered is not None and T > first_covered

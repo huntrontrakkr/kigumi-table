@@ -113,6 +113,8 @@ class Params:
     leg_lean: float = P(30.0, -60, 160, 1, "Legs", "Foot lean outward (mm)", sample=(10, 60))
     leg_splay: str = P("tilt", group="Legs", label="Lean by tilting a straight turned leg / bending the stem",
                        choices=["tilt", "bend"])
+    auto_splay: bool = P(False, group="Legs",
+                         label="Auto splay: lean the feet out until a 600 N push on the rim cannot tip it")
     leg_capital: str = P("round", group="Legs", label="Capital", choices=CAPITALS)
     leg_cap_d: float = P(104.0, 50, 180, 1, "Legs", "Capital diameter", sample=(96, 124))
     leg_cap_flare: float = P(22.0, 0, 80, 1, "Legs", "Capital flare height", sample=(10, 34))

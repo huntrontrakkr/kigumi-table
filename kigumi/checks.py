@@ -658,53 +658,55 @@ def check_glass(d: Design) -> list[dict]:
     return out
 
 
+def mass_centre(solid) -> tuple[float, np.ndarray]:
+    """Volume (mm^3) and centre of a closed solid, from its triangle mesh
+    (signed tetrahedra to the origin)."""
+    m = solid.to_mesh()
+    V = np.asarray(m.vert_properties, float)[:, :3]
+    T = np.asarray(m.tri_verts, np.int64)
+    if not len(T):
+        return 0.0, np.zeros(3)
+    a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]
+    vol = np.einsum("ij,ij->i", a, np.cross(b, c)) / 6.0
+    tot = float(vol.sum())
+    if abs(tot) < 1e-9:
+        return 0.0, np.zeros(3)
+    return tot, (vol[:, None] * (a + b + c)).sum(0) / (4.0 * tot)
+
+
 def check_stability(d: Design) -> list[dict]:
+    """Tipping: the smallest push down on the rim that tips the table over an
+    edge of its feet (stance.support_tip), from the real solids' weight and
+    centre of mass."""
+    from .stance import TIP_LOAD, support_tip
     lay = d.layout
-    p = d.p
-    pts = []
     W = 0.0
     m_xy = np.zeros(2)
     for q in d.parts:
-        kg = q.solid.volume() * 1e-9 * DENSITY.get(q.material, 600)
-        bb = q.solid.bounding_box()
-        c = np.array([(bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2])
+        if q.solid.is_empty():
+            continue
+        vol, c = mass_centre(q.solid)
+        kg = vol * 1e-9 * DENSITY.get(q.material, 600)
         W += kg * 9.81
-        m_xy += kg * 9.81 * c
+        m_xy += kg * 9.81 * c[:2]
     com = m_xy / max(W, 1e-9)
     # floor contact: the flat circle under each rounded foot
+    feet, radii = [], []
     for q in d.parts:
         if q.kind == "leg":
-            st = q.meta["stations"]
-            r0 = float(st["r"][0])
             L = lay.legs[q.meta["leg"]]
-            for a in np.linspace(0, 2 * np.pi, 24, endpoint=False):
-                pts.append(L.foot_xy + r0 * np.array([np.cos(a), np.sin(a)]))
-    hull = MultiPoint([tuple(x) for x in pts]).convex_hull
-    outline = lay.outline
-    worst = math.inf
-    worst_pt = None
-    ring = np.asarray(outline.exterior.coords)[::2]
-    hb = np.asarray(hull.exterior.coords) if hull.geom_type == "Polygon" else None
-    if hb is None:
-        return [item("Tipping", "fail", 0, 600, "legs do not enclose an area")]
-    for k in range(len(hb) - 1):
-        a, b = hb[k], hb[k + 1]
-        e = b - a
-        nrm = np.array([e[1], -e[0]]) / (np.linalg.norm(e) + 1e-12)     # outward for a ccw hull
-        if (com - a) @ nrm > 0:
-            nrm = -nrm
-        d_com = -float((com - a) @ nrm)
-        for pt in ring:
-            d_out = float((pt - a) @ nrm)
-            if d_out > 1.0:
-                Ptip = W * d_com / d_out
-                if Ptip < worst:
-                    worst, worst_pt = Ptip, pt
-    if not math.isfinite(worst):
-        return [item("Tipping", "pass", None, 600, "the top never reaches past the feet")]
-    st = "pass" if worst >= 600 else ("warn" if worst >= 350 else "fail")
-    return [item("Tipping", st, round(worst), 600,
-                 f"{worst:.0f} N pressing down at ({worst_pt[0]:.0f}, {worst_pt[1]:.0f}) on the rim tips it "
+            feet.append(L.foot_xy)
+            radii.append(float(q.meta["stations"]["r"][0]))
+    ring = np.asarray(lay.outline.exterior.coords)[::2]
+    t = support_tip(feet, radii, ring, W, com) if len(feet) >= 2 else None
+    if t is None:
+        return [item("Tipping", "fail", 0, TIP_LOAD, "legs do not enclose an area")]
+    if not math.isfinite(t["P"]):
+        return [item("Tipping", "pass", None, TIP_LOAD, "the top never reaches past the feet")]
+    worst, pt = t["P"], t["at"]
+    st = "pass" if worst >= TIP_LOAD else ("warn" if worst >= 350 else "fail")
+    return [item("Tipping", st, round(worst), TIP_LOAD,
+                 f"{worst:.0f} N pressing down at ({pt[0]:.0f}, {pt[1]:.0f}) on the rim tips it "
                  f"(table weighs {W / 9.81:.1f} kg; feet touch the floor on {float(st_r0(d)):.0f} mm circles)")]
 
 
