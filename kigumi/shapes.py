@@ -153,4 +153,8 @@ def overlap(a, b):
     a, b = _areal(a), _areal(b)
     if a.is_empty or b.is_empty:
         return Polygon()
+    ax0, ay0, ax1, ay1 = a.bounds
+    bx0, by0, bx1, by1 = b.bounds
+    if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:        # apart: skip the overlay
+        return Polygon()
     return _areal(a.intersection(b, grid_size=1e-3))

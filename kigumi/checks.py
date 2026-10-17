@@ -428,6 +428,41 @@ class Grillage:
         self._lu[key] = lu
         return lu
 
+    def _open_solve(self, rhs: np.ndarray, open_rows: np.ndarray):
+        """Solve with the contact rows `open_rows` opened.  Every load case
+        starts from all contacts closed and opens only a few laps and pads, so
+        instead of a factorization per contact state this updates the one
+        all-closed factorization F (Woodbury):
+
+            (K - kc C_o^T C_o)^-1 r = y + G (I/kc - C_o G)^-1 C_o y,
+            y = F^-1 r,  G = F^-1 C_o^T  (columns cached per row).
+
+        The small matrix is the opened contacts' flexibility; when it is too
+        close to singular to trust (an opened part with almost nothing
+        holding it) the state gets its own factorization instead."""
+        F = self._factor(np.ones(len(self._g0), dtype=bool))
+        y = F.solve(rhs)
+        if not len(open_rows):
+            return y
+        if not hasattr(self, "_G"):
+            self._G = {}
+        new = [int(j) for j in open_rows if int(j) not in self._G]
+        if new:
+            X = F.solve(np.asarray(self._C[new].T.todense()))
+            for k, j in enumerate(new):
+                self._G[j] = X[:, k]
+        G = np.stack([self._G[int(j)] for j in open_rows], axis=1)
+        Co = self._C[open_rows]
+        M = np.eye(len(open_rows)) / self.kc - Co @ G
+        try:
+            if np.linalg.cond(M) < 1e12:
+                return y + G @ np.linalg.solve(M, Co @ y)
+        except np.linalg.LinAlgError:
+            pass
+        active = np.ones(len(self._g0), dtype=bool)
+        active[open_rows] = False
+        return self._factor(active).solve(rhs)
+
     def solve(self, f: np.ndarray, iters: int = 12):
         """Linear solve with compression-only contacts (opening ones dropped)."""
         self._prep()
@@ -436,13 +471,18 @@ class Grillage:
         for it in range(iters):
             on = active | self._bil
             rhs = f - self.kc * (self._C[on].T @ self._g0[on]) if self._g0.any() else f
-            u = self._factor(active).solve(rhs)
+            u = self._open_solve(rhs, np.flatnonzero(~on))
             gap = self._C @ u + self._g0                 # > 0: the upper part lifts off
             want = (gap <= 1e-4) | self._bil
             if np.array_equal(want, active):
                 break
             active = want
         return u, list(active)
+
+    def release(self):
+        """Free the factorizations (they are large)."""
+        self._lu = {}
+        self._G = {}
 
     def top_deflection(self, u) -> np.ndarray:
         """Downward deflections of the surface one touches: the glass, or the top beams."""
@@ -549,7 +589,7 @@ def check_structure(d: Design, n_points: int = 28) -> list[dict]:
         sig_u, bid_u, _ = g.stresses(u)
     else:
         sig_u, bid_u = 0.0, None
-    g._lu.clear()                       # free the factorizations now (they are large)
+    g.release()
     out = []
     if worst["unstable"]:
         out.append(item("Load path", "fail", 0, 0,

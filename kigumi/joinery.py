@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from shapely import STRtree
+
 from .m3d import m3d
 
 from .model import Part, prism
@@ -104,13 +106,15 @@ def share_nodes(rels: list[Relation], parts: list[Part]) -> int:
     by_id = {q.id: q for q in parts}
     flush = [r for r in rels if r.kind == "split" and r.note.startswith("flush")]
     beams = [q for q in parts if q.kind == "beam"]
+    tree = STRtree([q.footprint for q in beams]) if flush else None
     n = 0
     for r in flush:
         P, Q = by_id[r.a], by_id[r.b]
         spot = overlap(P.footprint, Q.footprint)
         if spot.area < 1.0:
             continue
-        group = [P, Q] + [R for R in beams if R is not P and R is not Q and abs(R.zmin - P.zmin) < 1e-6
+        near = [beams[i] for i in sorted(tree.query(spot, predicate="intersects"))]
+        group = [P, Q] + [R for R in near if R is not P and R is not Q and abs(R.zmin - P.zmin) < 1e-6
                           and overlap(R.footprint, spot).area > 0.25 * spot.area]
         if len(group) <= 2:
             continue
@@ -153,10 +157,10 @@ def balance(rels: list[Relation], parts: list[Part], target: float = 0.5, max_it
             spots.append((X, rt, None))
         for rb in bots:
             spots.append((X, None, rb))
+        regs_b = [(rb, overlap(X.footprint, by_id[rb.a].footprint)) for rb in bots]
         for rt in tops:
             reg_t = overlap(X.footprint, by_id[rt.b].footprint)
-            for rb in bots:
-                reg_b = overlap(X.footprint, by_id[rb.a].footprint)
+            for rb, reg_b in regs_b:
                 if overlap(reg_t, reg_b).area >= 1.0:
                     spots.append((X, rt, rb))
     if not spots:
