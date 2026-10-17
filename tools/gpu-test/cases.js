@@ -114,6 +114,9 @@ function plan(params, manifest) {
   items.push({ id: 'int64_indices', group: 'robust', accept: ACCEPT, note: 'BigInt64Array indptr/indices (int64 from Python)',
     make: async () => { const c = laplace2d(24, 24, 2);
       return { ...c, name: 'laplace2d, int64 indices', indptr: BigInt64Array.from(c.indptr, BigInt), indices: BigInt64Array.from(c.indices, BigInt) }; } });
+  items.push({ id: 'device_lost', group: 'robust', accept: ACCEPT, note: 'device destroyed before the call: solveSPD takes a fresh one',
+    before: async (gpu) => { gpu.device.destroy(); await gpu.device.lost; await new Promise((r) => setTimeout(r, 0)); },
+    make: async () => ({ ...laplace2d(24, 24, 2), name: 'laplace2d after device loss' }) });
   items.push({ id: 'not_spd', group: 'robust', expectError: /not SPD/, note: 'negative diagonal entry: must throw',
     make: async () => { const c = laplace2d(10, 10, 1); const d = Float64Array.from(c.data);
       for (let p = c.indptr[5]; p < c.indptr[6]; p++) if (c.indices[p] === 5) d[p] = -1;
@@ -167,6 +170,7 @@ export async function runAll(params, onCase = () => {}, onLog = () => {}) {
     let c = null;
     try {
       c = await item.make();
+      if (item.before) await item.before(gpu);
       onLog(`${item.id}: n=${c.n} nnz=${Number(c.indptr[c.indptr.length - 1])} k=${c.k} ...`);
       const r = await sparse.solveSPD(gpu, {
         n: c.n, k: c.k, indptr: c.indptr, indices: c.indices, data: c.data, rhs: c.rhs,

@@ -588,7 +588,12 @@ export function solveSPD(gpu, opts) {
 async function solveImpl(gpu, o) {
   const t0 = now();
   if (!gpu || !gpu.device) throw new Error('solveSPD: no WebGPU device (getGpu() returned null?)');
-  if (gpu.lost) throw new Error('solveSPD: the WebGPU device was lost');
+  if (gpu.lost) {
+    // the device was lost (driver reset, GPU process crash): use a fresh one
+    const fresh = await getGpu();
+    if (!fresh) throw new Error('solveSPD: the WebGPU device was lost and none is available');
+    gpu = fresh;
+  }
   const n = o.n;
   const k = o.k == null ? 1 : o.k;
   if (!(k >= 0) || (k | 0) !== k) throw new RangeError(`k must be a non-negative integer, got ${k}`);
