@@ -14,6 +14,20 @@
 // Per-column scalars live in one storage buffer `scal` of NF fields of kp
 // floats (field f, column j at f*kp + j): no CPU read-back per iteration; the
 // host only polls the ACT flags every few dozen iterations.
+//
+// Device limits: every kernel binds at most 4 storage buffers and 1 uniform
+// buffer (WebGPU defaults: 8 and 12), 256 invocations per workgroup (default
+// 256) and at most 2 * 256 * 16 = 8 KiB of workgroup memory (default 16 KiB).
+// A CSR matrix is one self-describing u32 buffer:
+//   [ offset of the column indices, offset of the values, row pointers (n+1),
+//     column indices (nnz), values as f32 bits (nnz) ].
+export const LIMITS_USED = Object.freeze({
+  maxStorageBuffersPerShaderStage: 4,
+  maxUniformBuffersPerShaderStage: 1,
+  maxComputeInvocationsPerWorkgroup: 256,
+  maxComputeWorkgroupSizeX: 256,
+  maxComputeWorkgroupStorageSize: 8192,
+});
 
 export const WG = 256;          // threads per workgroup, row and element kernels
 export const RT = 64;           // threads per workgroup, final reductions
@@ -61,42 +75,39 @@ struct Params {
 }
 
 /**
- * Row kernel: y = M x for a CSR matrix M over all column groups, with
- *   dots = 0: nothing else;
- *   dots = 1: partial sums of x.y          (p.q for alpha);
- *   dots = 2: partial sums of r.y and r.r  (r.z and r.r for beta / convergence).
- * spmv = false (with dots = 2): no product, partial sums of r.r twice (Jacobi: z = r).
+ * Row kernel over all column groups, one thread per (row, column group):
+ *   'pq'    : y = M x (packed CSR M), partial sums of x.y          (p.q for alpha)
+ *   'tt_rr' : y = M x,               partial sums of y.y and x.x   (t = G r: r.z = |t|^2, and r.r)
+ *   'none'  : y = M x
+ *   'rr'    : no product,            partial sums of x.x twice     (Jacobi: z = r)
  */
-export function rowKernel(lay, { spmv = true, dots = 0 } = {}) {
+export function rowKernel(lay, mode) {
+  const spmv = mode !== 'rr';
+  const dots = mode === 'pq' ? 1 : mode === 'none' ? 0 : 2;
   const b = [];
-  if (spmv) {
-    b.push('@group(0) @binding(1) var<storage, read> rowptr : array<u32>;');
-    b.push('@group(0) @binding(2) var<storage, read> colidx : array<u32>;');
-    b.push('@group(0) @binding(3) var<storage, read> vals : array<f32>;');
-    b.push('@group(0) @binding(4) var<storage, read> xin : array<V>;');
-    b.push('@group(0) @binding(5) var<storage, read_write> yout : array<V>;');
-  }
+  if (spmv) b.push('@group(0) @binding(1) var<storage, read> mat : array<u32>;');
+  b.push('@group(0) @binding(2) var<storage, read> xin : array<V>;');
+  if (spmv) b.push('@group(0) @binding(3) var<storage, read_write> yout : array<V>;');
   if (dots >= 1) {
-    b.push('@group(0) @binding(6) var<storage, read_write> partial : array<V>;');
+    b.push('@group(0) @binding(4) var<storage, read_write> partial : array<V>;');
     b.push('var<workgroup> sh0 : array<V, WG>;');
   }
-  if (dots === 2) {
-    b.push('@group(0) @binding(7) var<storage, read> rvec : array<V>;');
-    b.push('var<workgroup> sh1 : array<V, WG>;');
-  }
+  if (dots === 2) b.push('var<workgroup> sh1 : array<V, WG>;');
   let body = '';
   if (spmv) {
     body += `
+    let io = mat[0];
+    let vo = mat[1];
     var acc = V(0.0);
-    let pend = rowptr[row + 1u];
-    for (var p = rowptr[row]; p < pend; p++) {
-      acc += vals[p] * xin[colidx[p] * C + c];
+    let pend = mat[3u + row];
+    for (var p = mat[2u + row]; p < pend; p++) {
+      acc += bitcast<f32>(mat[vo + p]) * xin[mat[io + p] * C + c];
     }
     yout[e] = acc;`;
-    if (dots === 1) body += '\n    d0 = acc * xin[e];';
-    if (dots === 2) body += '\n    let r = rvec[e];\n    d0 = acc * r;\n    d1 = r * r;';
+    if (mode === 'pq') body += '\n    d0 = acc * xin[e];';
+    if (mode === 'tt_rr') body += '\n    d0 = acc * acc;\n    let r = xin[e];\n    d1 = r * r;';
   } else {
-    body += '\n    let r = rvec[e];\n    d0 = r * r;\n    d1 = d0;';
+    body += '\n    let r = xin[e];\n    d0 = r * r;\n    d1 = d0;';
   }
   let red = '';
   if (dots >= 1) {
@@ -202,38 +213,44 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index)
 `;
 }
 
-/** x += alpha p; r -= alpha q (per column alpha). */
+/** r -= alpha q (per column alpha). */
 export function axpyKernel(lay) {
   return header(lay) + `
 @group(0) @binding(1) var<storage, read> scal : array<V>;
-@group(0) @binding(2) var<storage, read_write> xv : array<V>;
-@group(0) @binding(3) var<storage, read_write> rv : array<V>;
-@group(0) @binding(4) var<storage, read> pv : array<V>;
-@group(0) @binding(5) var<storage, read> qv : array<V>;
+@group(0) @binding(2) var<storage, read_write> rv : array<V>;
+@group(0) @binding(3) var<storage, read> qv : array<V>;
 @compute @workgroup_size(WG)
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) li : u32) {
   let e = (wid.x + wid.y * prm.egx) * WG + li;
   if (e >= prm.ne) { return; }
-  let a = scal[ALPHA * C + e % C];
-  xv[e] += a * pv[e];
-  rv[e] -= a * qv[e];
+  rv[e] -= scal[ALPHA * C + e % C] * qv[e];
 }
 `;
 }
 
-/** p = z + beta p (p = z where beta = 0, so stale or non-finite p never leaks in). */
+/**
+ * x += alpha p; p = z + beta p -- the end of an iteration (alpha and p are still
+ * this iteration's).  alpha = 0 leaves x alone and beta = 0 sets p = z, so a
+ * stale or non-finite p from an earlier solve never leaks in.
+ */
 export function xpbyKernel(lay) {
   return header(lay) + `
 @group(0) @binding(1) var<storage, read> scal : array<V>;
-@group(0) @binding(2) var<storage, read> zv : array<V>;
-@group(0) @binding(3) var<storage, read_write> pv : array<V>;
+@group(0) @binding(2) var<storage, read_write> xv : array<V>;
+@group(0) @binding(3) var<storage, read> zv : array<V>;
+@group(0) @binding(4) var<storage, read_write> pv : array<V>;
 @compute @workgroup_size(WG)
 fn main(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) li : u32) {
   let e = (wid.x + wid.y * prm.egx) * WG + li;
   if (e >= prm.ne) { return; }
-  let b = scal[BETA * C + e % C];
+  let c = e % C;
+  let a = scal[ALPHA * C + c];
+  let b = scal[BETA * C + c];
+  let p = pv[e];
+  let x = xv[e];
+  xv[e] = select(x + a * p, x, a == V(0.0));
   let z = zv[e];
-  pv[e] = select(z + b * pv[e], z, b == V(0.0));
+  pv[e] = select(z + b * p, z, b == V(0.0));
 }
 `;
 }

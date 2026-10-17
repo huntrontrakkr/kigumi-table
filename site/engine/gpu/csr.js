@@ -323,6 +323,26 @@ export function rowToCol(n, k, row, col, j0 = 0) {
   return col;
 }
 
+/**
+ * One self-describing u32 buffer for the GPU: [offset of indices, offset of
+ * values, row pointers (n+1), column indices (nnz), values as float32 bits].
+ */
+export function packCSR(n, ptr, idx, val) {
+  const nnz = ptr[n];
+  const io = n + 3;
+  const vo = io + nnz;
+  const out = new Uint32Array(vo + nnz);
+  out[0] = io;
+  out[1] = vo;
+  for (let i = 0; i <= n; i++) out[2 + i] = ptr[i];
+  for (let p = 0; p < nnz; p++) out[io + p] = idx[p];
+  new Float32Array(out.buffer, vo * 4, nnz).set(val.subarray ? val.subarray(0, nnz) : val);
+  return out;
+}
+
+/** Bytes of a packed CSR matrix (see packCSR). */
+export const packedBytes = (n, nnz) => 4 * (n + 3 + 2 * nnz);
+
 /** Element-wise equality of two typed arrays (same length). */
 export function sameArray(a, b) {
   if (!a || !b || a.length !== b.length) return false;

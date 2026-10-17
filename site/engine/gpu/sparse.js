@@ -6,7 +6,11 @@
 //   // r = { x: Float64Array(n*k), iters, refinements, relres: Float64Array(k), ms, converged, ... }
 //
 // A is full symmetric CSR (both triangles), rhs and x are column-major
-// (column j at [j*n, (j+1)*n)).  Works on the main thread and in workers.
+// (column j at [j*n, (j+1)*n)).  Works on the main thread and in workers, on
+// phones too: only WebGPU's default limits are requested (see LIMITS_USED in
+// kernels.js), no queue submission runs much longer than DEFAULTS.submitMs,
+// and a system too large for the device returns { converged: false, reason }
+// at once, so that the caller can use its CPU solver.
 //
 // Method (mixed-precision iterative refinement):
 //   * symmetric Jacobi scaling  As = S A S,  S = diag(1/sqrt(a_ii));
@@ -25,11 +29,13 @@
 // converge once cond(As) * 2^-24 approaches 1 (float32 cannot represent the
 // operator well enough).  See tools/gpu-test/NOTES.md for measurements.
 
-import { WG, NF, F, MAX_GRID, layoutFor, rowKernel, reduceKernel, axpyKernel, xpbyKernel } from './kernels.js';
+import { WG, NF, F, MAX_GRID, LIMITS_USED, layoutFor, rowKernel, reduceKernel, axpyKernel, xpbyKernel } from './kernels.js';
 import {
   asInt32, asFloat64, checkCSR, jacobiScale, fsai, transposeCSR, residualRowMajor,
-  colNormsRowMajor, colToRow, rowToCol, sameArray,
+  colNormsRowMajor, colToRow, rowToCol, sameArray, packCSR, packedBytes,
 } from './csr.js';
+
+export { LIMITS_USED };
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
@@ -39,11 +45,12 @@ export const DEFAULTS = Object.freeze({
   precond: 'fsai2',   // 'fsai2' (FSAI on the pattern of tril(A^2)), 'fsai' (tril(A): cheaper set-up,
                       //   ~2x the iterations), 'jacobi' (plain CG on the scaled system)
   checkEvery: 32,     // longest stretch of GPU iterations between read-backs
+  submitMs: 25,       // GPU time per queue submission (measured, adapted): mobile watchdogs reset long ones
   minGain: 0.5,       // a column stops after `patience` refinements without cutting its
   patience: 2,        //   residual by this factor
   floorFactor: 4,     // 'converged' also accepts relres <= floorFactor * float64 floor (see below)
   maxCols: 256,       // right-hand sides per GPU batch (more are solved in chunks)
-  memBudget: 512 * 1024 * 1024,   // bytes of GPU vectors per batch
+  memBudget: 256 * 1024 * 1024,   // bytes of GPU buffers per batch (more columns are chunked)
 });
 
 // ---------------------------------------------------------------- device
@@ -51,10 +58,11 @@ export const DEFAULTS = Object.freeze({
 let gpuPromise = null;
 
 /**
- * The WebGPU device (shared, created once), or null if WebGPU is unavailable.
- * Works in windows and dedicated workers (navigator.gpu exists in both).
- * info.fallback is true for software adapters (SwiftShader), where the
- * solver works but is slow.
+ * The WebGPU device (shared, created once), or null if WebGPU is unavailable
+ * or the adapter lacks the default limits the kernels use (LIMITS_USED).
+ * Requests no features and no limits beyond the defaults.  Works in windows
+ * and dedicated workers (navigator.gpu exists in both).  info.fallback is true
+ * for software adapters (SwiftShader), where the solver works but is slow.
  */
 export async function getGpu() {
   if (gpuPromise) {
@@ -72,23 +80,19 @@ export async function getGpu() {
       adapter = null;
     }
     if (!adapter) return null;
-    const al = adapter.limits;
-    const want = {};
-    for (const name of ['maxStorageBufferBindingSize', 'maxBufferSize', 'maxStorageBuffersPerShaderStage']) {
-      if (typeof al[name] === 'number') want[name] = al[name];
-    }
     let device = null;
     try {
-      device = await adapter.requestDevice({ requiredLimits: want });
+      device = await adapter.requestDevice();           // default limits, no features
     } catch {
-      try { device = await adapter.requestDevice(); } catch { device = null; }
+      device = null;
     }
     if (!device) return null;
     const dl = device.limits;
-    if (dl.maxStorageBuffersPerShaderStage < 7 || dl.maxComputeInvocationsPerWorkgroup < WG ||
-        dl.maxComputeWorkgroupSizeX < WG || dl.maxComputeWorkgroupStorageSize < 2 * WG * 16) {
-      device.destroy();
-      return null;
+    for (const [name, need] of Object.entries(LIMITS_USED)) {
+      if (!(dl[name] >= need)) {
+        device.destroy();
+        return null;
+      }
     }
     let ai = adapter.info;
     if (!ai && typeof adapter.requestAdapterInfo === 'function') {
@@ -115,12 +119,25 @@ export async function getGpu() {
     };
     device.lost.then((e) => {
       gpu.lost = true;
+      gpu._states.length = 0;
       if (gpuPromise) gpuPromise = null;
-      if (typeof console !== 'undefined') console.warn('WebGPU device lost:', e && e.message);
+      if (typeof console !== 'undefined' && e && e.reason !== 'destroyed') console.warn('WebGPU device lost:', e.message);
     });
+    if (typeof device.addEventListener === 'function') {
+      device.addEventListener('uncapturederror', (ev) => {
+        if (typeof console !== 'undefined') console.warn('WebGPU error:', ev.error && ev.error.message);
+      });
+    }
     return gpu;
   })();
   return gpuPromise;
+}
+
+/** Frees the GPU buffers kept between calls (they are re-made on the next solve). */
+export function releaseGpuBuffers(gpu) {
+  if (!gpu || !gpu._states) return;
+  for (const st of gpu._states) st.destroy();
+  gpu._states.length = 0;
 }
 
 // ------------------------------------------------- per-matrix preparation
@@ -142,14 +159,18 @@ function prepare(n, indptr, indices, data, precond) {
   const { s, scaled } = jacobiScale(n, indptr, indices, data);
   const e = {
     id: ++prepSerial, n, precond,
-    indptr: indptr.slice(), indices: indices.slice(), data: data.slice(),
-    s, A32: Float32Array.from(scaled), G: null, GT: null, fsaiFails: 0, setupMs: 0,
+    indptr: indptr.slice(), indices: indices.slice(), data: data.slice(), s,
+    mA: packCSR(n, indptr, indices, Float32Array.from(scaled)), mG: null, mGT: null,
+    nnzG: 0, fsaiFails: 0, setupMs: 0,
   };
   if (precond === 'fsai' || precond === 'fsai2') {
     const g = fsai(n, indptr, indices, scaled, precond === 'fsai2' ? 2 : 1);
     // transpose the float32 values so that G^T G is exactly symmetric on the GPU
-    e.G = { ptr: g.ptr, idx: g.idx, val: Float32Array.from(g.val) };
-    e.GT = transposeCSR(n, e.G.ptr, e.G.idx, e.G.val);
+    const val = Float32Array.from(g.val);
+    const gt = transposeCSR(n, g.ptr, g.idx, val);
+    e.mG = packCSR(n, g.ptr, g.idx, val);
+    e.mGT = packCSR(n, gt.ptr, gt.idx, gt.val);
+    e.nnzG = g.idx.length;
     e.fsaiFails = g.fails;
   } else if (precond !== 'jacobi') {
     throw new RangeError(`unknown preconditioner '${precond}'`);
@@ -161,6 +182,9 @@ function prepare(n, indptr, indices, data, precond) {
 }
 
 // ------------------------------------------------ GPU buffers and kernels
+
+/** A GPU resource problem (too large, out of memory, device lost): the caller should use its CPU solver. */
+class GpuResourceError extends Error {}
 
 async function pipeline(gpu, key, code) {
   let p = gpu._pipes.get(key);
@@ -184,7 +208,7 @@ async function pipeline(gpu, key, code) {
 async function pipelinesFor(gpu, lay, fs) {
   const tag = `${lay.W}x${lay.C}`;
   const want = {
-    spmm1: () => rowKernel(lay, { dots: 1 }),
+    spmmA: () => rowKernel(lay, 'pq'),
     redAlpha: () => reduceKernel(lay, 'alpha'),
     redBeta: () => reduceKernel(lay, 'beta'),
     redInit: () => reduceKernel(lay, 'init'),
@@ -192,10 +216,10 @@ async function pipelinesFor(gpu, lay, fs) {
     xpby: () => xpbyKernel(lay),
   };
   if (fs) {
-    want.spmm0 = () => rowKernel(lay, { dots: 0 });
-    want.spmm2 = () => rowKernel(lay, { dots: 2 });
+    want.spmmG = () => rowKernel(lay, 'tt_rr');
+    want.spmmGT = () => rowKernel(lay, 'none');
   } else {
-    want.dotR = () => rowKernel(lay, { spmv: false, dots: 2 });
+    want.dotR = () => rowKernel(lay, 'rr');
   }
   const names = Object.keys(want);
   const ps = await Promise.all(names.map((nm) => pipeline(gpu, `${nm}/${tag}`, want[nm]())));
@@ -204,43 +228,48 @@ async function pipelinesFor(gpu, lay, fs) {
 
 const align16 = (b) => Math.max(16, Math.ceil(b / 16) * 16);
 
-/** Largest batch of right-hand sides that fits the device limits and the memory budget. */
-function maxColumns(gpu, n, want, budget) {
+/** Bytes of GPU buffers for a prepared matrix and a lane layout, and the largest single buffer. */
+function stateBytes(prep, lay) {
+  const n = prep.n;
+  const vec = align16(n * lay.kp * 4);
+  const nwg = Math.ceil(n / lay.RPW);
+  const part = align16(2 * nwg * lay.kp * 4);
+  const mats = [prep.mA, prep.mG, prep.mGT].filter(Boolean).map((m) => align16(m.byteLength));
+  const nvec = prep.mG ? 7 : 5;                  // X R P Q (Z T) + the X read-back
+  const total = nvec * vec + part + mats.reduce((a, b) => a + b, 0) + 3 * align16(NF * lay.kp * 4) + 32;
+  return { total, largest: Math.max(vec, part, ...mats) };
+}
+
+/** Largest batch of right-hand sides (<= want) whose buffers fit the device and the budget, or 0. */
+function maxColumns(gpu, prep, want, budget) {
   const lim = gpu.device.limits;
   const cap = Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize);
   let k = Math.max(1, Math.min(want, 4 * WG));
-  while (k > 1) {
-    const kp = layoutFor(k).kp;
-    if (n * kp * 4 <= cap && 7 * n * kp * 4 <= budget) break;
+  for (;;) {
+    const sb = stateBytes(prep, layoutFor(k));
+    if (sb.largest <= cap && sb.total <= budget) return k;
+    if (k === 1) return 0;
     k = k > 4 ? Math.max(4, (k >> 1) & ~3) : k - 1;
   }
-  return k;
 }
 
 async function getState(gpu, prep, lay) {
-  const fs = !!prep.G;
-  const key = [prep.n, prep.A32.length, fs ? prep.G.idx.length : 0, lay.kp].join('/');
+  const key = [prep.n, prep.mA.length, prep.nnzG, lay.kp].join('/');
   let st = gpu._states.find((s) => s.key === key);
   if (st) {
     gpu._states.splice(gpu._states.indexOf(st), 1);
   } else {
+    // make room first: at most one other buffer set stays cached
+    while (gpu._states.length > 1) gpu._states.pop().destroy();
     st = await createState(gpu, prep, lay, key);
   }
   gpu._states.unshift(st);
-  while (gpu._states.length > 2) gpu._states.pop().destroy();
   if (st.prepId !== prep.id) {
     const q = gpu.device.queue;
-    const u32 = (a) => new Uint32Array(a.buffer, a.byteOffset, a.length);
-    q.writeBuffer(st.aPtr, 0, u32(prep.indptr));
-    q.writeBuffer(st.aIdx, 0, u32(prep.indices));
-    q.writeBuffer(st.aVal, 0, prep.A32);
-    if (fs) {
-      q.writeBuffer(st.gPtr, 0, u32(prep.G.ptr));
-      q.writeBuffer(st.gIdx, 0, u32(prep.G.idx));
-      q.writeBuffer(st.gVal, 0, prep.G.val);
-      q.writeBuffer(st.tPtr, 0, u32(prep.GT.ptr));
-      q.writeBuffer(st.tIdx, 0, u32(prep.GT.idx));
-      q.writeBuffer(st.tVal, 0, prep.GT.val);
+    q.writeBuffer(st.mA, 0, prep.mA);
+    if (st.fs) {
+      q.writeBuffer(st.mG, 0, prep.mG);
+      q.writeBuffer(st.mGT, 0, prep.mGT);
     }
     st.prepId = prep.id;
   }
@@ -251,7 +280,7 @@ async function createState(gpu, prep, lay, key) {
   const { device } = gpu;
   const n = prep.n;
   const { kp, C, RPW } = lay;
-  const fs = !!prep.G;
+  const fs = !!prep.mG;
   const pipes = await pipelinesFor(gpu, lay, fs);
   const nwg = Math.ceil(n / RPW);
   const gx = Math.min(nwg, MAX_GRID);
@@ -260,46 +289,46 @@ async function createState(gpu, prep, lay, key) {
   const newg = Math.ceil(ne / WG);
   const egx = Math.min(newg, MAX_GRID);
   const egy = Math.ceil(newg / egx);
-  const lim = device.limits;
   const vecBytes = n * kp * 4;
-  const partBytes = 2 * nwg * kp * 4;
-  const biggest = Math.max(vecBytes, partBytes, prep.A32.length * 4, fs ? prep.G.val.length * 4 : 0);
-  if (biggest > Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize)) {
-    throw new RangeError(`system too large for this GPU (${biggest} byte buffer)`);
-  }
   const STO = GPUBufferUsage.STORAGE, DST = GPUBufferUsage.COPY_DST, SRC = GPUBufferUsage.COPY_SRC;
   const all = [];
+  let bytes = 0;
   const buf = (size, usage, label) => {
     const b = device.createBuffer({ size: align16(size), usage, label });
     all.push(b);
+    bytes += align16(size);
     return b;
   };
-  const st = { key, n, lay, fs, pipes, nwg, prepId: 0, vecBytes, scalBytes: NF * kp * 4 };
+  const st = { key, n, lay, fs, pipes, nwg, prepId: 0, vecBytes, scalBytes: NF * kp * 4, msPerIter: 0 };
+  // out-of-memory and validation errors surface here instead of as a lost device later
+  device.pushErrorScope('out-of-memory');
+  device.pushErrorScope('validation');
   st.uni = buf(32, GPUBufferUsage.UNIFORM | DST, 'params');
-  st.aPtr = buf((n + 1) * 4, STO | DST, 'A.ptr');
-  st.aIdx = buf(prep.A32.length * 4, STO | DST, 'A.idx');
-  st.aVal = buf(prep.A32.length * 4, STO | DST, 'A.val');
+  st.mA = buf(prep.mA.byteLength, STO | DST, 'A');
   if (fs) {
-    st.gPtr = buf((n + 1) * 4, STO | DST, 'G.ptr');
-    st.gIdx = buf(prep.G.idx.length * 4, STO | DST, 'G.idx');
-    st.gVal = buf(prep.G.val.length * 4, STO | DST, 'G.val');
-    st.tPtr = buf((n + 1) * 4, STO | DST, 'GT.ptr');
-    st.tIdx = buf(prep.GT.idx.length * 4, STO | DST, 'GT.idx');
-    st.tVal = buf(prep.GT.val.length * 4, STO | DST, 'GT.val');
+    st.mG = buf(prep.mG.byteLength, STO | DST, 'G');
+    st.mGT = buf(prep.mGT.byteLength, STO | DST, 'GT');
   }
   st.X = buf(vecBytes, STO | SRC | DST, 'X');
   st.R = buf(vecBytes, STO | DST, 'R');
-  st.P = buf(vecBytes, STO | DST, 'P');
+  st.P = buf(vecBytes, STO, 'P');
   st.Q = buf(vecBytes, STO, 'Q');
   if (fs) {
     st.Z = buf(vecBytes, STO, 'Z');
     st.T = buf(vecBytes, STO, 'T');
   }
-  st.part = buf(partBytes, STO, 'partials');
-  st.scal = buf(st.scalBytes, STO | SRC | DST, 'scalars');
+  st.part = buf(2 * nwg * kp * 4, STO, 'partials');
+  st.scal = buf(st.scalBytes, STO | SRC, 'scalars');
   st.stageScal = buf(st.scalBytes, GPUBufferUsage.MAP_READ | DST, 'scalars.read');
   st.stageX = buf(vecBytes, GPUBufferUsage.MAP_READ | DST, 'X.read');
+  st.bytes = bytes;
   st.destroy = () => { for (const b of all) b.destroy(); };
+  const errV = await device.popErrorScope();
+  const errM = await device.popErrorScope();
+  if (errV || errM) {
+    st.destroy();
+    throw new GpuResourceError(`GPU buffers (${(bytes / 2 ** 20).toFixed(1)} MiB): ${(errM || errV).message}`);
+  }
 
   const params = new ArrayBuffer(32);
   const pu = new Uint32Array(params);
@@ -314,44 +343,44 @@ async function createState(gpu, prep, lay, key) {
     entries: Object.entries(entries).map(([b, buffer]) => ({ binding: +b, resource: { buffer } })),
   });
   const bg = {};
-  bg.A = bind(pipes.spmm1, { 0: st.uni, 1: st.aPtr, 2: st.aIdx, 3: st.aVal, 4: st.P, 5: st.Q, 6: st.part });
+  bg.A = bind(pipes.spmmA, { 0: st.uni, 1: st.mA, 2: st.P, 3: st.Q, 4: st.part });
   bg.redAlpha = bind(pipes.redAlpha, { 0: st.uni, 1: st.part, 2: st.scal });
   bg.redBeta = bind(pipes.redBeta, { 0: st.uni, 1: st.part, 2: st.scal });
   bg.redInit = bind(pipes.redInit, { 0: st.uni, 1: st.part, 2: st.scal });
-  bg.axpy = bind(pipes.axpy, { 0: st.uni, 1: st.scal, 2: st.X, 3: st.R, 4: st.P, 5: st.Q });
+  bg.axpy = bind(pipes.axpy, { 0: st.uni, 1: st.scal, 2: st.R, 3: st.Q });
   if (fs) {
-    bg.G = bind(pipes.spmm0, { 0: st.uni, 1: st.gPtr, 2: st.gIdx, 3: st.gVal, 4: st.R, 5: st.T });
-    bg.GT = bind(pipes.spmm2, { 0: st.uni, 1: st.tPtr, 2: st.tIdx, 3: st.tVal, 4: st.T, 5: st.Z, 6: st.part, 7: st.R });
-    bg.xpby = bind(pipes.xpby, { 0: st.uni, 1: st.scal, 2: st.Z, 3: st.P });
+    bg.G = bind(pipes.spmmG, { 0: st.uni, 1: st.mG, 2: st.R, 3: st.T, 4: st.part });
+    bg.GT = bind(pipes.spmmGT, { 0: st.uni, 1: st.mGT, 2: st.T, 3: st.Z });
+    bg.xpby = bind(pipes.xpby, { 0: st.uni, 1: st.scal, 2: st.X, 3: st.Z, 4: st.P });
   } else {
-    bg.dotR = bind(pipes.dotR, { 0: st.uni, 6: st.part, 7: st.R });
-    bg.xpby = bind(pipes.xpby, { 0: st.uni, 1: st.scal, 2: st.R, 3: st.P });
+    bg.dotR = bind(pipes.dotR, { 0: st.uni, 2: st.R, 4: st.part });
+    bg.xpby = bind(pipes.xpby, { 0: st.uni, 1: st.scal, 2: st.X, 3: st.R, 4: st.P });
   }
 
   const rows = (pass, p, g) => { pass.setPipeline(p); pass.setBindGroup(0, g); pass.dispatchWorkgroups(gx, gy); };
   const elems = (pass, p, g) => { pass.setPipeline(p); pass.setBindGroup(0, g); pass.dispatchWorkgroups(egx, egy); };
   const red = (pass, p, g) => { pass.setPipeline(p); pass.setBindGroup(0, g); pass.dispatchWorkgroups(C); };
   const precondition = (pass) => {
-    // z = G^T (G r), with partial sums of r.z and r.r (Jacobi: z = r)
+    // z = G^T (G r), with partial sums of r.z = |G r|^2 and r.r (Jacobi: z = r)
     if (fs) {
-      rows(pass, pipes.spmm0, bg.G);
-      rows(pass, pipes.spmm2, bg.GT);
+      rows(pass, pipes.spmmG, bg.G);
+      rows(pass, pipes.spmmGT, bg.GT);
     } else {
       rows(pass, pipes.dotR, bg.dotR);
     }
   };
   st.encodeInit = (pass) => {
     precondition(pass);
-    red(pass, pipes.redInit, bg.redInit);       // rz, rr0, tol2, active flags; beta = 0
+    red(pass, pipes.redInit, bg.redInit);       // rz, rr0, tol2, active flags; alpha = beta = 0
     elems(pass, pipes.xpby, bg.xpby);           // p = z
   };
   st.encodeIter = (pass) => {
-    rows(pass, pipes.spmm1, bg.A);              // q = As p, partial p.q
+    rows(pass, pipes.spmmA, bg.A);              // q = As p, partial p.q
     red(pass, pipes.redAlpha, bg.redAlpha);     // alpha = rz / p.q
-    elems(pass, pipes.axpy, bg.axpy);           // x += alpha p, r -= alpha q
+    elems(pass, pipes.axpy, bg.axpy);           // r -= alpha q
     precondition(pass);                         // z = M^-1 r, partial r.z, r.r
     red(pass, pipes.redBeta, bg.redBeta);       // beta = rz'/rz, convergence flags
-    elems(pass, pipes.xpby, bg.xpby);           // p = z + beta p
+    elems(pass, pipes.xpby, bg.xpby);           // x += alpha p, p = z + beta p
   };
   return st;
 }
@@ -362,6 +391,11 @@ async function createState(gpu, prep, lay, key) {
  * Batched float32 PCG on the scaled system for the (row-major, kp-padded)
  * right-hand sides rs, from x = 0, each column to a relative residual eta
  * (or stagnation, or maxIter).  Returns the float32 solutions (row-major).
+ *
+ * The iterations between two read-backs are split into queue submissions of
+ * about opt.submitMs of GPU time each (the time per iteration is measured on
+ * the first few iterations and kept per buffer set), so that a slow mobile GPU
+ * never sees one long-running submission.
  */
 async function innerSolve(gpu, st, rs, opt) {
   const { device } = gpu;
@@ -373,24 +407,38 @@ async function innerSolve(gpu, st, rs, opt) {
   const bestAt = new Float64Array(kp);
   const prevRR = new Float64Array(kp);
   let its = 0;
-  let m = Math.min(opt.checkEvery, maxIter);
-  let first = true;
+  let m = Math.min(st.msPerIter ? opt.checkEvery : 4, maxIter);   // unknown speed: a short first stretch
+  let started = false;
+  let havePrev = false;
   let stagnated = false;
+  let submits = 0;
   let sc = null;
   for (;;) {
-    const enc = device.createCommandEncoder();
-    if (first) enc.clearBuffer(st.X);
-    const pass = enc.beginComputePass();
-    if (first) st.encodeInit(pass);
-    for (let t = 0; t < m; t++) st.encodeIter(pass);
-    pass.end();
-    enc.copyBufferToBuffer(st.scal, 0, st.stageScal, 0, st.scalBytes);
-    enc.copyBufferToBuffer(st.X, 0, st.stageX, 0, st.vecBytes);
-    device.queue.submit([enc.finish()]);
+    const per = st.msPerIter ? Math.max(1, Math.min(m, Math.floor(opt.submitMs / st.msPerIter))) : 1;
+    const t0 = now();
+    for (let left = m; left > 0;) {
+      const s = Math.min(per, left);
+      left -= s;
+      const enc = device.createCommandEncoder();
+      if (!started) enc.clearBuffer(st.X);
+      const pass = enc.beginComputePass();
+      if (!started) st.encodeInit(pass);
+      started = true;
+      for (let t = 0; t < s; t++) st.encodeIter(pass);
+      pass.end();
+      if (left === 0) {
+        enc.copyBufferToBuffer(st.scal, 0, st.stageScal, 0, st.scalBytes);
+        enc.copyBufferToBuffer(st.X, 0, st.stageX, 0, st.vecBytes);
+      }
+      device.queue.submit([enc.finish()]);
+      submits++;
+    }
     its += m;
     await st.stageScal.mapAsync(GPUMapMode.READ);
     sc = new Float32Array(st.stageScal.getMappedRange().slice(0));
     st.stageScal.unmap();
+    const msIt = (now() - t0) / m;
+    st.msPerIter = st.msPerIter ? 0.5 * (st.msPerIter + msIt) : msIt;
     // poll: active columns, convergence rate, stagnation
     let active = 0;
     let need = 0;
@@ -406,12 +454,12 @@ async function innerSolve(gpu, st, rs, opt) {
       if (rr < 0.25 * best[j]) { best[j] = rr; bestAt[j] = its; }
       if (its - bestAt[j] < Math.max(1000, its / 2)) stalled = false;
       // iterations still needed at the current rate (log-linear model)
-      const rate = first || !(prevRR[j] > 0) ? 0 : Math.log(rr / prevRR[j]) / m;
+      const rate = !havePrev || !(prevRR[j] > 0) ? 0 : Math.log(rr / prevRR[j]) / m;
       const est = rate < 0 && tol2 > 0 ? Math.log(tol2 / rr) / rate : opt.checkEvery;
       if (est > need) need = est;
       prevRR[j] = rr;
     }
-    first = false;
+    havePrev = true;
     if (!active || its >= maxIter) break;
     if (stalled) { stagnated = true; break; }
     m = Math.max(4, Math.min(opt.checkEvery, Math.ceil(need) + 1, maxIter - its));
@@ -425,7 +473,7 @@ async function innerSolve(gpu, st, rs, opt) {
     const rr0 = sc[F.RR0 * kp + j];
     colRel[j] = rr0 > 0 ? Math.sqrt(Math.max(0, sc[F.RR * kp + j]) / rr0) : 0;
   }
-  return { X, its, colIts, colRel, stagnated };
+  return { X, its, colIts, colRel, stagnated, submits };
 }
 
 // ----------------------------------------------------------- outer solve
@@ -467,6 +515,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   const rel = relOf(colNormsRowMajor(n, m, r), bn);
   let cpuMs = now() - tc;
   let gpuMs = 0;
+  let submits = 0;
   const best = Float64Array.from(rel);          // lowest relres so far (iterate in xBest)
   const mark = Float64Array.from(rel);          // relres at the last halving ...
   const markAt = new Int32Array(m).fill(-1);    // ... and when
@@ -478,6 +527,7 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   const okCol = new Uint8Array(m);
   let iters = 0;
   let refinements = 0;
+  let failure = null;
   const stop = (j, ref) => {
     if (rel[j] <= tol) return 'tol';
     if (floor[j] > 0 && rel[j] <= floor[j]) return 'floor';
@@ -503,10 +553,19 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
     }
     cpuMs += now() - tc;
     const tg = now();
-    if (!st) st = await getState(gpu, prep, lay);
-    const inner = await innerSolve(gpu, st, rs, opt);
+    let inner;
+    try {
+      if (!st) st = await getState(gpu, prep, lay);
+      inner = await innerSolve(gpu, st, rs, opt);
+    } catch (e) {
+      // GPU trouble (out of memory, lost device, ...): keep the best iterate so far
+      failure = e;
+      for (const j of act) why[j] = 'gpu';
+      break;
+    }
     gpuMs += now() - tg;
     iters += inner.its;
+    submits += inner.submits;
     refinements++;
     // x += S d (columns with a non-finite correction are left alone and stop)
     tc = now();
@@ -540,18 +599,17 @@ async function solveBlock(gpu, prep, rhs, x0, j0, m, tol, opt) {
   }
   // return the best iterate of each column
   tc = now();
-  let restored = false;
   for (let j = 0; j < m; j++) {
     if (!(rel[j] <= best[j])) {
       for (let i = 0; i < n; i++) x[i * m + j] = xBest[i * m + j];
-      restored = true;
     }
   }
   residualRowMajor(n, m, indptr, indices, data, x, b, r, floor);
   const relFinal = relOf(colNormsRowMajor(n, m, r), bn);
   cpuMs += now() - tc;
   for (let j = 0; j < m; j++) if (!why[j]) why[j] = 'maxRefine';
-  return { x, relres: relFinal, floor, iters, refinements, history, gpuMs, cpuMs, kp, restored, why };
+  return { x, relres: relFinal, floor, iters, refinements, history, gpuMs, cpuMs, kp, why, failure,
+    gpuBytes: st ? st.bytes : 0, submits, msPerIter: st ? st.msPerIter : 0 };
 }
 
 // -------------------------------------------------------------------- API
@@ -565,24 +623,51 @@ let queue = Promise.resolve();
  *   rhs (Float64Array n*k, column-major), k (default 1), tol (default 1e-9, on
  *   ||b - A x||_2 / ||b||_2 per column), maxIter (inner PCG iterations per
  *   refinement, default max(2000, 2n)), x0 (initial guess, column-major), and
- *   tuning knobs from DEFAULTS (eta, maxRefine, precond, checkEvery, ...).
+ *   tuning knobs from DEFAULTS (eta, maxRefine, precond, checkEvery, submitMs, ...).
  * Returns { x: Float64Array(n*k), iters, refinements, relres: Float64Array(k),
  *   ms, converged } plus diagnostics: floor (Float64Array(k), the float64
  *   attainable-residual estimate u||A||x|+|b||/||b|| of each column), tolMet
  *   (every relres <= tol), stopped (per column: 'tol' | 'floor' | 'stalled' |
- *   'maxRefine' | 'non-finite'), setupMs, gpuMs, cpuMs, precond, history.
+ *   'maxRefine' | 'non-finite' | 'gpu' | 'unsolved'), reason (why not
+ *   converged, when it is a resource problem), setupMs, gpuMs, cpuMs, gpuBytes,
+ *   submits, precond, history.
  * converged: every column has relres <= tol, or relres <= floorFactor * floor
  *   (solved to float64 working precision: no float64 method -- SuperLU
  *   included -- certifies a smaller residual for that column).  Use tolMet for
  *   the strict test.
- * Calls are serialised (the GPU buffers are shared).  Throws on malformed input
- * or a non-positive diagonal; returns converged = false if the tolerance is not
- * reached (relres then says how far it got; x is the best iterate found).
+ * A system too large for the device's buffers or the memory budget, an
+ *   out-of-memory error or a lost device give converged = false with `reason`
+ *   (quickly: the size checks come before any set-up).  Malformed input and a
+ *   non-positive diagonal throw.  Calls are serialised (the GPU buffers are
+ *   shared).  If the tolerance is not reached, relres says how far it got and
+ *   x is the best iterate found.
  */
 export function solveSPD(gpu, opts) {
   const run = queue.then(() => solveImpl(gpu, opts));
   queue = run.then(() => {}, () => {});
   return run;
+}
+
+/** The answer for a system the GPU will not take: x0 (or 0), with its residual. */
+function unsolved(n, k, indptr, indices, data, rhs, x0, reason, t0) {
+  const x = x0 ? Float64Array.from(x0.subarray(0, n * k)) : new Float64Array(n * k);
+  const relres = new Float64Array(k);
+  for (let j = 0; j < k; j++) {
+    let rr = 0, bb = 0;
+    const o = j * n;
+    for (let i = 0; i < n; i++) {
+      let ax = 0;
+      if (x0) for (let p = indptr[i]; p < indptr[i + 1]; p++) ax += data[p] * x[o + indices[p]];
+      const ri = rhs[o + i] - ax;
+      rr += ri * ri;
+      bb += rhs[o + i] * rhs[o + i];
+    }
+    relres[j] = bb > 0 ? Math.sqrt(rr / bb) : Math.sqrt(rr);
+  }
+  return {
+    x, iters: 0, refinements: 0, relres, ms: now() - t0, converged: false, tolMet: false,
+    floor: new Float64Array(k), stopped: new Array(k).fill('unsolved'), reason,
+  };
 }
 
 async function solveImpl(gpu, o) {
@@ -614,17 +699,41 @@ async function solveImpl(gpu, o) {
   const relres = new Float64Array(k);
   const floor = new Float64Array(k);
   if (n === 0 || k === 0) {
-    return { x, iters: 0, refinements: 0, relres, floor, ms: now() - t0, converged: true };
+    return { x, iters: 0, refinements: 0, relres, floor, ms: now() - t0, converged: true, tolMet: true, stopped: [] };
   }
   const nnz = indptr[n];
-  const { prep, fresh } = prepare(n, indptr.subarray(0, n + 1), indices.subarray(0, nnz), data.subarray(0, nnz), opt.precond);
-  const kmax = maxColumns(gpu, n, opt.maxCols, opt.memBudget);
+  // too large for this device?  Decide before any set-up work.
+  const lim = gpu.device.limits;
+  const cap = Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize);
+  const minBytes = 5 * align16(n * 4) + align16(packedBytes(n, nnz));
+  if (packedBytes(n, nnz) > cap || minBytes > opt.memBudget) {
+    return unsolved(n, k, indptr, indices, data, rhs, x0,
+      `system too large for this GPU (matrix ${(packedBytes(n, nnz) / 2 ** 20).toFixed(1)} MiB, binding limit ` +
+      `${(cap / 2 ** 20).toFixed(0)} MiB, budget ${(opt.memBudget / 2 ** 20).toFixed(0)} MiB)`, t0);
+  }
+  // the preconditioner, stepping down (fsai2 -> fsai -> jacobi) if its factor does not fit
+  const ladder = ['fsai2', 'fsai', 'jacobi'];
+  let precond = opt.precond;
+  let { prep, fresh } = prepare(n, indptr.subarray(0, n + 1), indices.subarray(0, nnz), data.subarray(0, nnz), precond);
+  let kmax = maxColumns(gpu, prep, opt.maxCols, opt.memBudget);
+  while (!kmax && ladder.indexOf(precond) >= 0 && ladder.indexOf(precond) < ladder.length - 1) {
+    precond = ladder[ladder.indexOf(precond) + 1];
+    ({ prep, fresh } = prepare(n, indptr.subarray(0, n + 1), indices.subarray(0, nnz), data.subarray(0, nnz), precond));
+    kmax = maxColumns(gpu, prep, opt.maxCols, opt.memBudget);
+  }
+  if (!kmax) {
+    return unsolved(n, k, indptr, indices, data, rhs, x0, 'system too large for this GPU (vectors exceed the limits)', t0);
+  }
   const nchunks = Math.ceil(k / kmax);
   const kc = Math.ceil(k / nchunks);
   let iters = 0;
   let refinements = 0;
   let gpuMs = 0;
   let cpuMs = 0;
+  let gpuBytes = 0;
+  let submits = 0;
+  let msPerIter = 0;
+  let reason;
   const history = [];
   const stopped = new Array(k);
   for (let j0 = 0; j0 < k; j0 += kc) {
@@ -638,17 +747,35 @@ async function solveImpl(gpu, o) {
     refinements = Math.max(refinements, r.refinements);
     gpuMs += r.gpuMs;
     cpuMs += r.cpuMs;
+    gpuBytes = Math.max(gpuBytes, r.gpuBytes);
+    submits += r.submits;
+    msPerIter = r.msPerIter || msPerIter;
     history.push(r.history);
+    if (r.failure) {
+      // free what we hold: the next call starts from fresh buffers (or a fresh device)
+      releaseGpuBuffers(gpu);
+      reason = r.failure instanceof GpuResourceError ? r.failure.message : `GPU error: ${r.failure.message || r.failure}`;
+      for (let j = j0 + m; j < k; j++) stopped[j] = 'unsolved';
+      if (j0 + m < k) {
+        const rest = unsolved(n, k, indptr, indices, data, rhs, x0, reason, t0);
+        for (let j = j0 + m; j < k; j++) {
+          relres[j] = rest.relres[j];
+          x.set(rest.x.subarray(j * n, (j + 1) * n), j * n);
+        }
+      }
+      break;
+    }
   }
-  let converged = true;
-  let tolMet = true;
+  let converged = !reason;
+  let tolMet = !reason;
   for (let j = 0; j < k; j++) {
     if (!(relres[j] <= tol)) tolMet = false;
     if (!(relres[j] <= Math.max(tol, opt.floorFactor * floor[j]))) converged = false;
   }
   return {
     x, iters, refinements, relres, ms: now() - t0, converged, tolMet, floor, stopped,
-    precond: opt.precond, setupMs: fresh ? prep.setupMs : 0, gpuMs, cpuMs,
+    ...(reason ? { reason } : {}),
+    precond, setupMs: fresh ? prep.setupMs : 0, gpuMs, cpuMs, gpuBytes, submits, msPerIter,
     fsaiFails: prep.fsaiFails, chunks: nchunks, history: nchunks === 1 ? history[0] : history,
   };
 }
